@@ -250,6 +250,89 @@ bool isMallocApi(uint32_t id) {
   return false;
 }
 
+bool isEventRecordApi(uint32_t id) {
+  switch (id) {
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord:
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord_spt:
+#ifdef ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecordWithFlags
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecordWithFlags:
+#endif
+      return true;
+      break;
+    default:;
+  }
+  return false;
+}
+
+bool isSyncApi(uint32_t id) {
+  switch (id) {
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent:
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent_spt:
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventSynchronize:
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamSynchronize:
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamSynchronize_spt:
+    case ROCPROFILER_HIP_RUNTIME_API_ID_hipDeviceSynchronize:
+      return true;
+      break;
+    default:;
+  }
+  return false;
+}
+
+struct event_record_args {
+  hipEvent_t event{nullptr};
+  hipStream_t stream{nullptr};
+};
+auto extract_event_record_args =
+    []([[maybe_unused]] rocprofiler_callback_tracing_kind_t kind,
+       [[maybe_unused]] rocprofiler_tracing_operation_t operation,
+       [[maybe_unused]] uint32_t arg_num,
+       const void* const arg_value_addr,
+       [[maybe_unused]] int32_t indirection_count,
+       [[maybe_unused]] const char* arg_type,
+       const char* arg_name,
+       [[maybe_unused]] const char* arg_value_str,
+       [[maybe_unused]] int32_t dereference_count,
+       void* cb_data) -> int {
+  auto& args = *(static_cast<event_record_args*>(cb_data));
+  if (strcmp("event", arg_name) == 0)
+    args.event = *(reinterpret_cast<const hipEvent_t*>(arg_value_addr));
+  else if (strcmp("stream", arg_name) == 0)
+    args.stream = *(reinterpret_cast<const hipStream_t*>(arg_value_addr));
+  return 0;
+};
+
+struct sync_args {
+  hipStream_t stream{nullptr};
+  hipEvent_t event{nullptr};
+};
+auto extract_sync_args =
+    []([[maybe_unused]] rocprofiler_callback_tracing_kind_t kind,
+       [[maybe_unused]] rocprofiler_tracing_operation_t operation,
+       [[maybe_unused]] uint32_t arg_num,
+       const void* const arg_value_addr,
+       [[maybe_unused]] int32_t indirection_count,
+       [[maybe_unused]] const char* arg_type,
+       const char* arg_name,
+       [[maybe_unused]] const char* arg_value_str,
+       [[maybe_unused]] int32_t dereference_count,
+       void* cb_data) -> int {
+  auto& args = *(static_cast<sync_args*>(cb_data));
+  if (strcmp("stream", arg_name) == 0)
+    args.stream = *(reinterpret_cast<const hipStream_t*>(arg_value_addr));
+  else if (strcmp("event", arg_name) == 0)
+    args.event = *(reinterpret_cast<const hipEvent_t*>(arg_value_addr));
+  return 0;
+};
+
+// Maps hipEvent_t -> {hipStream_t, correlation_id} from hipEventRecord calls
+struct EventMapEntry {
+  hipStream_t stream{nullptr};
+  uint64_t corrId{0};
+};
+std::mutex g_eventMapMutex;
+std::unordered_map<void*, EventMapEntry> g_eventMap;
+
 class RocprofApiIdList : public ApiIdList {
  public:
   RocprofApiIdList(callback_name_info& names);
@@ -670,6 +753,81 @@ void RocprofLogger::api_callback(
             endTime,
             args.ptr,
             args.size);
+        insert_row_to_buffer(row);
+      }
+      // Event Record
+      else if (isEventRecordApi(record.operation)) {
+        event_record_args args;
+        rocprofiler_iterate_callback_tracing_kind_operation_args(
+            record, extract_event_record_args, 1, &args);
+
+        {
+          std::lock_guard<std::mutex> lock(g_eventMapMutex);
+          g_eventMap[static_cast<void*>(args.event)] =
+              {args.stream, record.correlation_id.internal};
+        }
+
+        rocprofEventRecordRow* row = new rocprofEventRecordRow(
+            record.correlation_id.internal,
+            record.kind,
+            record.operation,
+            processId(),
+            systemThreadId(),
+            startTime,
+            endTime,
+            args.event,
+            args.stream);
+        insert_row_to_buffer(row);
+      }
+      // Sync APIs (stream wait event, event sync, stream sync, device sync)
+      else if (isSyncApi(record.operation)) {
+        sync_args args;
+        rocprofiler_iterate_callback_tracing_kind_operation_args(
+            record, extract_sync_args, 1, &args);
+
+        rocprofSyncType syncType;
+        hipStream_t srcStream = nullptr;
+        uint64_t srcCorrId = 0;
+
+        switch (record.operation) {
+          case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent:
+          case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent_spt:
+          {
+            syncType = ROCPROF_SYNC_STREAM_WAIT_EVENT;
+            std::lock_guard<std::mutex> lock(g_eventMapMutex);
+            auto it = g_eventMap.find(static_cast<void*>(args.event));
+            if (it != g_eventMap.end()) {
+              srcStream = it->second.stream;
+              srcCorrId = it->second.corrId;
+            }
+            break;
+          }
+          case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventSynchronize:
+            syncType = ROCPROF_SYNC_EVENT_SYNCHRONIZE;
+            break;
+          case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamSynchronize:
+          case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamSynchronize_spt:
+            syncType = ROCPROF_SYNC_STREAM_SYNCHRONIZE;
+            break;
+          case ROCPROFILER_HIP_RUNTIME_API_ID_hipDeviceSynchronize:
+          default:
+            syncType = ROCPROF_SYNC_DEVICE_SYNCHRONIZE;
+            break;
+        }
+
+        rocprofSyncRow* row = new rocprofSyncRow(
+            record.correlation_id.internal,
+            record.kind,
+            record.operation,
+            processId(),
+            systemThreadId(),
+            startTime,
+            endTime,
+            syncType,
+            args.stream,
+            args.event,
+            srcStream,
+            srcCorrId);
         insert_row_to_buffer(row);
       }
       // Default Records
