@@ -15,6 +15,8 @@
 #include <time.h>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <unistd.h>
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -275,6 +277,52 @@ struct MockRocLogger {
     activities_.push_back(row);
   }
 
+#ifndef ROCTRACER_FALLBACK
+  void addEventRecordActivity(
+      int64_t start_ns,
+      int64_t end_ns,
+      int64_t correlation,
+      hipEvent_t event,
+      hipStream_t stream) {
+    rocprofEventRecordRow* row = new rocprofEventRecordRow(
+        correlation,
+        RUNTIME_DOMAIN,
+        ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord,
+        processId(),
+        systemThreadId(),
+        start_ns,
+        end_ns,
+        event,
+        stream);
+    activities_.push_back(row);
+  }
+
+  void addSyncActivity(
+      int64_t start_ns,
+      int64_t end_ns,
+      int64_t correlation,
+      rocprofSyncType syncType,
+      hipStream_t stream,
+      hipEvent_t event,
+      hipStream_t srcStream,
+      uint64_t srcCorrId) {
+    rocprofSyncRow* row = new rocprofSyncRow(
+        correlation,
+        RUNTIME_DOMAIN,
+        ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent,
+        processId(),
+        systemThreadId(),
+        start_ns,
+        end_ns,
+        syncType,
+        stream,
+        event,
+        srcStream,
+        srcCorrId);
+    activities_.push_back(row);
+  }
+#endif
+
   ~MockRocLogger() {
     while (!activities_.empty()) {
       auto act = activities_.back();
@@ -443,7 +491,8 @@ TEST_F(RocmActivityProfilerTest, SyncTrace) {
 
 #ifdef __linux__
   char filename[] = "/tmp/libkineto_testXXXXXX.json";
-  mkstemps(filename, 5);
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
   trace.save(filename);
   // Check that the expected file was written and that it has some content
   int fd = open(filename, O_RDONLY);
@@ -583,7 +632,8 @@ TEST_F(RocmActivityProfilerTest, GpuNCCLCollectiveTest) {
 #ifdef __linux__
   // Test saved output can be loaded as JSON
   char filename[] = "/tmp/libkineto_testXXXXXX.json";
-  mkstemps(filename, 5);
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
   LOG(INFO) << "Logging to tmp file: " << filename;
   trace.save(filename);
 
@@ -740,7 +790,8 @@ TEST_F(RocmActivityProfilerTest, SubActivityProfilers) {
   EXPECT_TRUE(profiler.isActive());
 
   char filename[] = "/tmp/libkineto_testXXXXXX.json";
-  mkstemps(filename, 5);
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
   LOG(INFO) << "Logging to tmp file " << filename;
 
   // process trace
@@ -816,7 +867,8 @@ TEST_F(RocmActivityProfilerTest, JsonGPUIDSortTest) {
 #ifdef __linux__
   // Test saved output can be loaded as JSON
   char filename[] = "/tmp/libkineto_testXXXXXX.json";
-  mkstemps(filename, 5);
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
   LOG(INFO) << "Logging to tmp file: " << filename;
   trace.save(filename);
 
@@ -857,3 +909,92 @@ TEST_F(RocmActivityProfilerTest, JsonGPUIDSortTest) {
   }
 #endif
 }
+
+#ifndef ROCTRACER_FALLBACK
+TEST_F(RocmActivityProfilerTest, InterStreamDependencyTest) {
+  std::vector<std::string> log_modules({"RocmActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 300;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // Simulate: hipEventRecord(event=0xA, stream=0x1) with corr=10
+  // then hipStreamWaitEvent(stream=0x2, event=0xA) with corr=20
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xA);
+  hipStream_t stream0 = reinterpret_cast<hipStream_t>(0x1);
+  hipStream_t stream1 = reinterpret_cast<hipStream_t>(0x2);
+
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 20, start_time_ns + 25, 10, fakeEvent, stream0);
+  gpuOps->addSyncActivity(
+      start_time_ns + 30, start_time_ns + 35, 20,
+      ROCPROF_SYNC_STREAM_WAIT_EVENT, stream1, fakeEvent, stream0, 10);
+  gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 100, 1);
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  // Verify event record and sync activities are present
+  int eventRecordCount = 0;
+  int syncCount = 0;
+  for (auto& activity : *trace.activities()) {
+    if (activity->name() == "hipEventRecord") {
+      eventRecordCount++;
+    }
+    if (activity->name() == "hipStreamWaitEvent") {
+      syncCount++;
+    }
+  }
+  EXPECT_EQ(eventRecordCount, 1);
+  EXPECT_EQ(syncCount, 1);
+
+  // Verify JSON output contains dependency metadata
+  char filename[] = "/tmp/libkineto_interstream_testXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  auto& traceEvents = j["traceEvents"];
+
+  bool foundEventRecord = false;
+  bool foundSyncWithDep = false;
+  for (auto& ev : traceEvents) {
+    if (ev.value("name", "") == "hipEventRecord") {
+      foundEventRecord = true;
+      EXPECT_TRUE(ev["args"].contains("hip_event"));
+      EXPECT_TRUE(ev["args"].contains("hip_stream"));
+    }
+    if (ev.value("name", "") == "hipStreamWaitEvent") {
+      foundSyncWithDep = true;
+      EXPECT_TRUE(ev["args"].contains("sync_type"));
+      EXPECT_EQ(ev["args"]["sync_type"], "stream_wait_event");
+      EXPECT_TRUE(ev["args"].contains("wait_on_stream"));
+      EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_record_corr_id"));
+      EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 10);
+    }
+  }
+  EXPECT_TRUE(foundEventRecord);
+  EXPECT_TRUE(foundSyncWithDep);
+
+  unlink(filename);
+}
+#endif
