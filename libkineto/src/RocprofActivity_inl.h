@@ -239,6 +239,63 @@ inline const std::string RuntimeActivity<rocprofMallocRow>::metadataJson() const
       raw().ptr);
 }
 
+template <>
+inline const std::string RuntimeActivity<rocprofEventRecordRow>::metadataJson()
+    const {
+  return fmt::format(
+      R"JSON(
+      "cid": {}, "correlation": {},
+      "hip_event": "{}", "hip_stream": "{}")JSON",
+      raw().cid,
+      raw().id,
+      fmt::ptr(raw().event),
+      fmt::ptr(raw().stream));
+}
+
+template <>
+inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
+  static const char* syncTypeNames[] = {
+      "stream_wait_event",
+      "event_synchronize",
+      "stream_synchronize",
+      "device_synchronize",
+  };
+  const char* syncName = (raw().syncType >= 0 && raw().syncType <= 3)
+      ? syncTypeNames[raw().syncType]
+      : "unknown";
+
+  std::string meta = fmt::format(
+      R"JSON(
+      "cid": {}, "correlation": {},
+      "sync_type": "{}")JSON",
+      raw().cid,
+      raw().id,
+      syncName);
+
+  if (raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT && raw().srcStream) {
+    meta += fmt::format(
+        R"JSON(,
+      "wait_on_stream": "{}",
+      "wait_on_hip_event_record_corr_id": {},
+      "wait_on_hip_event": "{}")JSON",
+        fmt::ptr(raw().srcStream),
+        raw().srcCorrId,
+        fmt::ptr(raw().event));
+  } else if (raw().stream) {
+    meta += fmt::format(
+        R"JSON(,
+      "hip_stream": "{}")JSON",
+        fmt::ptr(raw().stream));
+  }
+  if (raw().event && raw().syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) {
+    meta += fmt::format(
+        R"JSON(,
+      "hip_event": "{}")JSON",
+        fmt::ptr(raw().event));
+  }
+  return meta;
+}
+
 template <class T>
 inline const std::string RuntimeActivity<T>::metadataJson() const {
   return fmt::format(
