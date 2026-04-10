@@ -272,12 +272,10 @@ inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
       raw().id,
       syncName);
 
-  if (raw().stream) {
-    meta += fmt::format(
-        R"JSON(,
+  meta += fmt::format(
+      R"JSON(,
       "hip_stream": "{}")JSON",
-        fmt::ptr(raw().stream));
-  }
+      fmt::ptr(raw().stream));
   if (raw().event) {
     meta += fmt::format(
         R"JSON(,
