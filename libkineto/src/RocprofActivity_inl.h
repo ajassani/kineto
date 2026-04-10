@@ -282,7 +282,7 @@ inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
       "hip_event": "{}")JSON",
         fmt::ptr(raw().event));
   }
-  if (raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT && raw().srcStream) {
+  if (raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT && raw().srcCorrId) {
     meta += fmt::format(
         R"JSON(,
       "wait_on_stream": "{}",
