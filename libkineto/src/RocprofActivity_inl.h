@@ -272,26 +272,25 @@ inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
       raw().id,
       syncName);
 
-  if (raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT && raw().srcStream) {
-    meta += fmt::format(
-        R"JSON(,
-      "wait_on_stream": "{}",
-      "wait_on_hip_event_record_corr_id": {},
-      "wait_on_hip_event": "{}")JSON",
-        fmt::ptr(raw().srcStream),
-        raw().srcCorrId,
-        fmt::ptr(raw().event));
-  } else if (raw().stream) {
+  if (raw().stream) {
     meta += fmt::format(
         R"JSON(,
       "hip_stream": "{}")JSON",
         fmt::ptr(raw().stream));
   }
-  if (raw().event && raw().syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) {
+  if (raw().event) {
     meta += fmt::format(
         R"JSON(,
       "hip_event": "{}")JSON",
         fmt::ptr(raw().event));
+  }
+  if (raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT && raw().srcStream) {
+    meta += fmt::format(
+        R"JSON(,
+      "wait_on_stream": "{}",
+      "wait_on_hip_event_record_corr_id": {})JSON",
+        fmt::ptr(raw().srcStream),
+        raw().srcCorrId);
   }
   return meta;
 }
