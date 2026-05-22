@@ -850,31 +850,8 @@ void RocprofLogger::api_callback(
         switch (record.operation) {
           case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent:
           case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent_spt:
-          {
             syncType = ROCPROF_SYNC_STREAM_WAIT_EVENT;
-            std::lock_guard<std::mutex> lock(g_eventMapMutex);
-            auto it = g_eventMap.find(static_cast<void*>(args.event));
-            if (it != g_eventMap.end()) {
-              const auto& vec = it->second;
-              // Find the most recent record whose correlationId is strictly
-              // less than the wait's own correlationId. The vector is sorted by
-              // correlationId, so upper_bound + prev gives that record.
-              uint64_t queryCorrId = record.correlation_id.internal;
-              auto pos = std::upper_bound(
-                  vec.begin(),
-                  vec.end(),
-                  queryCorrId,
-                  [](uint64_t val, const EventMapEntry& a) {
-                    return val < a.corrId;
-                  });
-              if (pos != vec.begin()) {
-                auto prev = std::prev(pos);
-                srcStream = prev->stream;
-                srcCorrId = prev->corrId;
-              }
-            }
             break;
-          }
           case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventSynchronize:
             syncType = ROCPROF_SYNC_EVENT_SYNCHRONIZE;
             break;
@@ -886,6 +863,35 @@ void RocprofLogger::api_callback(
           default:
             syncType = ROCPROF_SYNC_DEVICE_SYNCHRONIZE;
             break;
+        }
+
+        // For sync types that wait on a specific hipEvent_t (stream wait event
+        // and event synchronize), look up the most recent hipEventRecord on
+        // that event whose correlationId strictly precedes this sync's, so we
+        // can emit the producer stream + corr_id in the trace metadata.
+        // Matches CUPTI's isEventSync() handling for STREAM_WAIT_EVENT and
+        // EVENT_SYNCHRONIZE.
+        if ((syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT ||
+             syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) &&
+            args.event != nullptr) {
+          std::lock_guard<std::mutex> lock(g_eventMapMutex);
+          auto it = g_eventMap.find(static_cast<void*>(args.event));
+          if (it != g_eventMap.end()) {
+            const auto& vec = it->second;
+            uint64_t queryCorrId = record.correlation_id.internal;
+            auto pos = std::upper_bound(
+                vec.begin(),
+                vec.end(),
+                queryCorrId,
+                [](uint64_t val, const EventMapEntry& a) {
+                  return val < a.corrId;
+                });
+            if (pos != vec.begin()) {
+              auto prev = std::prev(pos);
+              srcStream = prev->stream;
+              srcCorrId = prev->corrId;
+            }
+          }
         }
 
         rocprofSyncRow* row = new rocprofSyncRow(
