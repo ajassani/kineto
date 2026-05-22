@@ -282,13 +282,32 @@ inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
       "hip_event": "{}")JSON",
         fmt::ptr(raw().event));
   }
-  if (raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT && raw().srcCorrId) {
+  // Inter-stream dependency metadata: emitted for sync types that wait on a
+  // specific hipEvent_t (stream wait event, event synchronize) whenever the
+  // event was resolved against a prior hipEventRecord in g_eventMap. Field
+  // names mirror CUPTI's `wait_on_*` keys for CuptiActivityProfiler parity:
+  //
+  //   wait_on_stream                    <=> CUPTI wait_on_stream
+  //   wait_on_hip_event_record_corr_id  <=> CUPTI wait_on_cuda_event_record_corr_id
+  //   wait_on_hip_event_id              <=> CUPTI wait_on_cuda_event_id
+  //
+  // The last field reports the hipEvent_t handle the wait was issued against,
+  // independent of whether a producer record was found.
+  if ((raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT ||
+       raw().syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) &&
+      raw().event) {
     meta += fmt::format(
         R"JSON(,
+      "wait_on_hip_event_id": "{}")JSON",
+        fmt::ptr(raw().event));
+    if (raw().srcCorrId) {
+      meta += fmt::format(
+          R"JSON(,
       "wait_on_stream": "{}",
       "wait_on_hip_event_record_corr_id": {})JSON",
-        fmt::ptr(raw().srcStream),
-        raw().srcCorrId);
+          fmt::ptr(raw().srcStream),
+          raw().srcCorrId);
+    }
   }
   return meta;
 }
