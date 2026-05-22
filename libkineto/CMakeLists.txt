@@ -246,6 +246,14 @@ elseif(KINETO_BACKEND STREQUAL "rocm")
   endif()
   target_compile_definitions(kineto_base PRIVATE "__HIP_PLATFORM_HCC__")
   target_compile_definitions(kineto_base PRIVATE "__HIP_PLATFORM_AMD__")
+  # The rocprofiler-sdk and HSA system headers (anonymous structs, flexible
+  # array members, etc.) trip -Werror=pedantic when callers (e.g. PyTorch's
+  # cmake/Dependencies.cmake) propagate -Wpedantic to us. Silence pedantic for
+  # the kineto sources only; the headers themselves come from /opt/rocm and
+  # we can't change them.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    list(APPEND KINETO_COMPILE_OPTIONS "-Wno-pedantic")
+  endif()
 elseif(KINETO_BACKEND STREQUAL "xpu")
   list(APPEND KINETO_COMPILE_OPTIONS ${XPUPTI_BUILD_FLAG})
   if(KINETO_BUILD_TESTS)
