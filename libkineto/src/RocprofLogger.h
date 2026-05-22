@@ -37,6 +37,12 @@ class RocprofLogger {
   static void pushCorrelationID(uint64_t id, RocLogger::CorrelationDomain type);
   static void popCorrelationID(RocLogger::CorrelationDomain type);
 
+  // Clears the global hipEvent_t -> {stream, correlationId} map populated by
+  // hipEventRecord callbacks. Must be called between profiling sessions
+  // (typically from RocmActivityProfiler::onResetTraceData) to prevent stale
+  // entries from a previous trace polluting the next one.
+  static void clearEventMap();
+
   static void ensureRegistered();
   void startLogging();
   void stopLogging();
