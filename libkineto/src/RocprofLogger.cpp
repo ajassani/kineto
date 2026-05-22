@@ -612,6 +612,50 @@ void RocprofLogger::popCorrelationID(CorrelationDomain type) {
   }
 }
 
+void RocprofLogger::recordEvent(
+    void* event,
+    void* stream,
+    uint64_t corrId) {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  auto& vec = g_eventMap[event];
+  EventMapEntry entry{static_cast<hipStream_t>(stream), corrId};
+  auto pos = std::lower_bound(
+      vec.begin(),
+      vec.end(),
+      entry.corrId,
+      [](const EventMapEntry& a, uint64_t val) { return a.corrId < val; });
+  vec.insert(pos, entry);
+}
+
+bool RocprofLogger::resolveWait(
+    void* event,
+    uint64_t queryCorrId,
+    void** outStream,
+    uint64_t* outCorrId) {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  auto it = g_eventMap.find(event);
+  if (it == g_eventMap.end()) {
+    return false;
+  }
+  const auto& vec = it->second;
+  auto pos = std::upper_bound(
+      vec.begin(),
+      vec.end(),
+      queryCorrId,
+      [](uint64_t val, const EventMapEntry& a) { return val < a.corrId; });
+  if (pos == vec.begin()) {
+    return false;
+  }
+  auto prev = std::prev(pos);
+  if (outStream) {
+    *outStream = static_cast<void*>(prev->stream);
+  }
+  if (outCorrId) {
+    *outCorrId = prev->corrId;
+  }
+  return true;
+}
+
 void RocprofLogger::clearEventMap() {
   std::lock_guard<std::mutex> lock(g_eventMapMutex);
   g_eventMap.clear();
@@ -780,19 +824,10 @@ void RocprofLogger::api_callback(
         rocprofiler_iterate_callback_tracing_kind_operation_args(
             record, extract_event_record_args, 1, &args);
 
-        {
-          std::lock_guard<std::mutex> lock(g_eventMapMutex);
-          auto& vec = g_eventMap[static_cast<void*>(args.event)];
-          EventMapEntry entry{args.stream, record.correlation_id.internal};
-          auto pos = std::lower_bound(
-              vec.begin(),
-              vec.end(),
-              entry.corrId,
-              [](const EventMapEntry& a, uint64_t val) {
-                return a.corrId < val;
-              });
-          vec.insert(pos, entry);
-        }
+        recordEvent(
+            static_cast<void*>(args.event),
+            static_cast<void*>(args.stream),
+            record.correlation_id.internal);
 
         rocprofEventRecordRow* row = new rocprofEventRecordRow(
             record.correlation_id.internal,
@@ -843,23 +878,15 @@ void RocprofLogger::api_callback(
         if ((syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT ||
              syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) &&
             args.event != nullptr) {
-          std::lock_guard<std::mutex> lock(g_eventMapMutex);
-          auto it = g_eventMap.find(static_cast<void*>(args.event));
-          if (it != g_eventMap.end()) {
-            const auto& vec = it->second;
-            uint64_t queryCorrId = record.correlation_id.internal;
-            auto pos = std::upper_bound(
-                vec.begin(),
-                vec.end(),
-                queryCorrId,
-                [](uint64_t val, const EventMapEntry& a) {
-                  return val < a.corrId;
-                });
-            if (pos != vec.begin()) {
-              auto prev = std::prev(pos);
-              srcStream = prev->stream;
-              srcCorrId = prev->corrId;
-            }
+          void* resolvedStream = nullptr;
+          uint64_t resolvedCorrId = 0;
+          if (resolveWait(
+                  static_cast<void*>(args.event),
+                  record.correlation_id.internal,
+                  &resolvedStream,
+                  &resolvedCorrId)) {
+            srcStream = static_cast<hipStream_t>(resolvedStream);
+            srcCorrId = resolvedCorrId;
           }
         }
 
