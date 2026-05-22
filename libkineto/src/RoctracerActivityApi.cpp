@@ -74,7 +74,7 @@ void RoctracerActivityApi::popCorrelationID(CorrelationFlowType type) {
 #endif
 }
 
-void RoctracerActivityApi::setMaxBufferSize(int64_t size) {
+void RoctracerActivityApi::setMaxBufferSize([[maybe_unused]] int64_t size) {
   // FIXME: implement?
   // maxGpuBufferCount_ = 1 + size / kBufSize;
 }

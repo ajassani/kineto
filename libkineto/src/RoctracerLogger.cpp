@@ -169,7 +169,7 @@ void RoctracerLogger::api_callback(
     uint32_t domain,
     uint32_t cid,
     const void* callback_data,
-    void* arg) {
+    [[maybe_unused]] void* arg) {
   RoctracerLogger* dis = &singleton();
 
   if (domain == ACTIVITY_DOMAIN_HIP_API && dis->loggedIds_.contains(cid)) {
@@ -461,7 +461,7 @@ void RoctracerLogger::api_callback(
 void RoctracerLogger::activity_callback(
     const char* begin,
     const char* end,
-    void* arg) {
+    [[maybe_unused]] void* arg) {
   // Log latest completed correlation id.  Used to ensure we have flushed all
   // data on stop
   std::unique_lock<std::mutex> lock(s_flush.mutex_);
