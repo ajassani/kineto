@@ -62,6 +62,47 @@ if(NOT DEFINED CACHE{KINETO_BACKEND} AND NOT DEFINED KINETO_BACKEND)
   set(_kineto_backend_explicit OFF)
 endif()
 
+# Legacy variable translation. Older callers (e.g. PyTorch's
+# cmake/Dependencies.cmake) set LIBKINETO_NOCUPTI / LIBKINETO_NOROCTRACER /
+# LIBKINETO_NOXPUPTI to OFF to opt into a particular backend, never having
+# heard of KINETO_BACKEND. Without this shim those builds silently fall
+# back to KINETO_BACKEND=cpu and skip compiling the backend they asked for.
+# Only honour the legacy vars if the caller did not also set KINETO_BACKEND
+# explicitly (the new variable wins).
+if(NOT _kineto_backend_explicit)
+  set(_legacy_backend "")
+  if(DEFINED LIBKINETO_NOCUPTI AND NOT LIBKINETO_NOCUPTI)
+    set(_legacy_backend "cuda")
+  endif()
+  if(DEFINED LIBKINETO_NOROCTRACER AND NOT LIBKINETO_NOROCTRACER)
+    if(_legacy_backend)
+      message(WARNING
+        "Both LIBKINETO_NOCUPTI=OFF and LIBKINETO_NOROCTRACER=OFF set. "
+        "KINETO_BACKEND is single-valued; picking '${_legacy_backend}'. "
+        "Set KINETO_BACKEND directly to disambiguate.")
+    else()
+      set(_legacy_backend "rocm")
+    endif()
+  endif()
+  if(DEFINED LIBKINETO_NOXPUPTI AND NOT LIBKINETO_NOXPUPTI)
+    if(_legacy_backend)
+      message(WARNING
+        "LIBKINETO_NOXPUPTI=OFF set together with another legacy backend "
+        "selector. Keeping '${_legacy_backend}'.")
+    else()
+      set(_legacy_backend "xpu")
+    endif()
+  endif()
+  if(_legacy_backend)
+    message(STATUS
+      "Translating legacy LIBKINETO_NO* selectors -> KINETO_BACKEND=${_legacy_backend}")
+    set(KINETO_BACKEND "${_legacy_backend}" CACHE STRING
+        "Kineto GPU backend: cpu, cuda, rocm, or xpu" FORCE)
+    set(_kineto_backend_explicit ON)
+  endif()
+  unset(_legacy_backend)
+endif()
+
 set(KINETO_BACKEND "cpu" CACHE STRING
     "Kineto GPU backend: cpu, cuda, rocm, or xpu")
 set_property(CACHE KINETO_BACKEND PROPERTY STRINGS cpu cuda rocm xpu)
