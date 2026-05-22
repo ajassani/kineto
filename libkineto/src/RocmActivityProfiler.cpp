@@ -162,6 +162,12 @@ void RocmActivityProfiler::popCorrelationIdImpl(CorrelationFlowType type) {
 
 void RocmActivityProfiler::onResetTraceData() {
   roc_.teardownContext();
+#ifndef ROCTRACER_FALLBACK
+  // Drop any hipEvent_t -> {stream, corrId} entries left over from the prior
+  // profiling session so they cannot be returned as the producer of a wait
+  // recorded in the next session. Mirrors CuptiActivityProfiler::onResetTraceData.
+  RocprofLogger::clearEventMap();
+#endif
 }
 
 void RocmActivityProfiler::onFinalizeTrace(

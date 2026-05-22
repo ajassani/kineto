@@ -17,9 +17,11 @@
 
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 #include "ApproximateClock.h"
 #include "Demangle.h"
@@ -325,13 +327,25 @@ auto extract_sync_args =
   return 0;
 };
 
-// Maps hipEvent_t -> {hipStream_t, correlation_id} from hipEventRecord calls
+// Maps hipEvent_t -> sorted vector of {hipStream_t, correlation_id} for every
+// hipEventRecord observed on that event handle.
+//
+// HIP event handles are reused: applications routinely call hipEventRecord on
+// the same hipEvent_t many times across the trace. Storing only the most
+// recent record (single-entry map) gives wrong attribution when an earlier
+// hipStreamWaitEvent fires its callback after a later hipEventRecord (cudaEvent
+// callbacks are not guaranteed in-order across streams).
+//
+// The vector is kept sorted by correlationId so that a hipStreamWaitEvent
+// callback can binary-search for the most recent record whose correlationId is
+// strictly less than its own (i.e., the producer record it actually waits on).
+// This mirrors CUPTI's `waitEventMap` design in CuptiActivityProfiler.cpp.
 struct EventMapEntry {
   hipStream_t stream{nullptr};
   uint64_t corrId{0};
 };
 std::mutex g_eventMapMutex;
-std::unordered_map<void*, EventMapEntry> g_eventMap;
+std::unordered_map<void*, std::vector<EventMapEntry>> g_eventMap;
 
 class RocprofApiIdList : public ApiIdList {
  public:
@@ -598,6 +612,11 @@ void RocprofLogger::popCorrelationID(CorrelationDomain type) {
   }
 }
 
+void RocprofLogger::clearEventMap() {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  g_eventMap.clear();
+}
+
 void RocprofLogger::clearLogs() {
   // CuptiActivityProfiler clears this before the output Loggers use the data
   // for (auto &row : rows_)
@@ -763,8 +782,16 @@ void RocprofLogger::api_callback(
 
         {
           std::lock_guard<std::mutex> lock(g_eventMapMutex);
-          g_eventMap[static_cast<void*>(args.event)] =
-              {args.stream, record.correlation_id.internal};
+          auto& vec = g_eventMap[static_cast<void*>(args.event)];
+          EventMapEntry entry{args.stream, record.correlation_id.internal};
+          auto pos = std::lower_bound(
+              vec.begin(),
+              vec.end(),
+              entry.corrId,
+              [](const EventMapEntry& a, uint64_t val) {
+                return a.corrId < val;
+              });
+          vec.insert(pos, entry);
         }
 
         rocprofEventRecordRow* row = new rocprofEventRecordRow(
@@ -797,8 +824,23 @@ void RocprofLogger::api_callback(
             std::lock_guard<std::mutex> lock(g_eventMapMutex);
             auto it = g_eventMap.find(static_cast<void*>(args.event));
             if (it != g_eventMap.end()) {
-              srcStream = it->second.stream;
-              srcCorrId = it->second.corrId;
+              const auto& vec = it->second;
+              // Find the most recent record whose correlationId is strictly
+              // less than the wait's own correlationId. The vector is sorted by
+              // correlationId, so upper_bound + prev gives that record.
+              uint64_t queryCorrId = record.correlation_id.internal;
+              auto pos = std::upper_bound(
+                  vec.begin(),
+                  vec.end(),
+                  queryCorrId,
+                  [](uint64_t val, const EventMapEntry& a) {
+                    return val < a.corrId;
+                  });
+              if (pos != vec.begin()) {
+                auto prev = std::prev(pos);
+                srcStream = prev->stream;
+                srcCorrId = prev->corrId;
+              }
             }
             break;
           }
