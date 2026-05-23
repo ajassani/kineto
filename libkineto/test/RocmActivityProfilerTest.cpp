@@ -447,6 +447,12 @@ class MockRocActivities : public RocprofActivityApi {
       externalCorrelations.clear();
     }
     detail::backfillAsyncCopyStreams(activityLogger->activities_, isAsyncCopy);
+#ifdef ROCTRACER_FALLBACK
+    // Mirror the production processGpuActivities path: resolve any
+    // sync rows that callbacks left unresolved (the new deferred
+    // resolution scheme) before they are handed to the trace logger.
+    RoctracerLogger::resolvePendingSyncs(activityLogger->activities_);
+#endif
     for (auto& item : activityLogger->activities_) {
       handler(item);
       ++count;
@@ -1303,6 +1309,87 @@ TEST_F(RocmActivityProfilerTest, StreamWaitEventFutureCorrelation) {
     }
   }
   EXPECT_TRUE(foundWait);
+  unlink(filename);
+
+  RoctracerLogger::clearEventMap();
+}
+
+// Verifies the deferred-resolution scheme handles out-of-order callback
+// delivery. roctracer callbacks are dispatched from the calling thread
+// at HIP_API_PHASE_EXIT, so a hipStreamWaitEvent callback on thread T2
+// can land before the producing hipEventRecord callback on thread T1.
+// Resolving producer attribution at api_callback time loses the link in
+// that case; deferring resolution to buffer-flush time recovers it.
+TEST_F(RocmActivityProfilerTest, StreamWaitEventCallbackArrivesBeforeRecord) {
+  RoctracerLogger::clearEventMap();
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 500;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xE2);
+  hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
+  hipStream_t consumer = reinterpret_cast<hipStream_t>(0x2);
+
+  // 1. The wait callback arrives FIRST -- the map is still empty, so the
+  //    row is pushed unresolved (srcStream=nullptr, srcCorrId=0). This
+  //    matches what RoctracerLogger::api_callback now does for every
+  //    hipStreamWaitEvent.
+  gpuOps->addSyncActivity(
+      start_time_ns + 40, start_time_ns + 45, /*correlation=*/200,
+      ROCPROF_SYNC_STREAM_WAIT_EVENT, consumer, fakeEvent,
+      /*srcStream=*/nullptr, /*srcCorrId=*/0);
+
+  // 2. The producing record callback arrives AFTER the wait. Populates
+  //    g_eventMap.
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 20, start_time_ns + 25, /*correlation=*/100,
+      fakeEvent, producer);
+
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  // processTrace will call processGpuActivities, which calls
+  // resolvePendingSyncs on the mock buffer (wired in MockRocActivities).
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  char filename[] = "/tmp/libkineto_late_recordXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  bool foundResolvedWait = false;
+  for (auto& ev : j["traceEvents"]) {
+    if (ev.value("name", "") == "hipStreamWaitEvent" &&
+        ev.contains("args") &&
+        ev["args"].contains("wait_on_hip_event_record_corr_id")) {
+      foundResolvedWait = true;
+      EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 100)
+          << "Deferred resolution should have back-filled the producer "
+             "attribution from the late-arriving record callback.";
+      EXPECT_TRUE(ev["args"].contains("wait_on_stream"));
+    }
+  }
+  EXPECT_TRUE(foundResolvedWait)
+      << "hipStreamWaitEvent activity with resolved producer not found "
+         "-- deferred resolution did not run or the buffer order broke it.";
   unlink(filename);
 
   RoctracerLogger::clearEventMap();

@@ -118,6 +118,23 @@ class RoctracerLogger {
   // entries from a previous trace polluting the next one.
   static void clearEventMap();
 
+  // Walks the singleton's pending row buffer and resolves producer
+  // attribution for every wait-event / event-sync row that was left
+  // unresolved at api_callback time. Called from
+  // RocmActivityProfiler::processGpuActivities before rows are emitted,
+  // so that out-of-order callback delivery (e.g. the hipStreamWaitEvent
+  // callback landing on a different thread before the producing
+  // hipEventRecord callback lands on its own thread) still resolves
+  // correctly as long as the producer record has arrived by the end of
+  // the trace.
+  static void resolvePendingSyncs();
+
+  // Testable overload: resolve sync rows in an arbitrary buffer (e.g.
+  // the mock RocLogger's local activities_ list in unit tests). Same
+  // semantics as the no-arg form but does NOT take the singleton's
+  // rows mutex; the caller is responsible for any synchronization.
+  static void resolvePendingSyncs(std::vector<rocprofBase*>& rows);
+
   void startLogging();
   void stopLogging();
   void clearLogs();

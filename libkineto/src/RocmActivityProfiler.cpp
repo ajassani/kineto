@@ -193,6 +193,12 @@ void RocmActivityProfiler::processGpuActivities(ActivityLogger& logger) {
           std::placeholders::_2,
           std::placeholders::_3));
 #else
+  // Resolve producer attribution for any wait-event / event-sync rows
+  // that were left unresolved at api_callback delivery time. By now all
+  // hipEventRecord callbacks for the trace have run, so resolution sees
+  // the final state of g_eventMap and is robust to cross-thread
+  // out-of-order callback delivery.
+  RoctracerLogger::resolvePendingSyncs();
   const int count = roc_.processActivities(
       std::bind(
           &RocmActivityProfiler::handleRoctracerActivity,

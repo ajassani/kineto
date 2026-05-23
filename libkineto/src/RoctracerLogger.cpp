@@ -95,6 +95,45 @@ void RoctracerLogger::clearEventMap() {
   g_eventMap.clear();
 }
 
+void RoctracerLogger::resolvePendingSyncs(std::vector<rocprofBase*>& rows) {
+  for (auto* row : rows) {
+    if (row == nullptr || row->type != ROCTRACER_ACTIVITY_SYNC) {
+      continue;
+    }
+    auto* sync = static_cast<rocprofSyncRow*>(row);
+    // Only wait-event / event-sync rows have a producer to look up.
+    // Stream-sync and device-sync are producer-less by construction.
+    if (sync->syncType != ROCPROF_SYNC_STREAM_WAIT_EVENT &&
+        sync->syncType != ROCPROF_SYNC_EVENT_SYNCHRONIZE) {
+      continue;
+    }
+    if (sync->event == nullptr) {
+      continue;
+    }
+    // Already resolved (either at construction time, by a test helper,
+    // or by a prior resolvePendingSyncs pass) -- leave it alone.
+    if (sync->srcStream != nullptr || sync->srcCorrId != 0) {
+      continue;
+    }
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    if (resolveWait(
+            static_cast<void*>(sync->event),
+            sync->id,
+            &outStream,
+            &outCorrId)) {
+      sync->srcStream = static_cast<hipStream_t>(outStream);
+      sync->srcCorrId = outCorrId;
+    }
+  }
+}
+
+void RoctracerLogger::resolvePendingSyncs() {
+  RoctracerLogger* dis = &singleton();
+  std::lock_guard<std::mutex> lock(dis->rowsMutex_);
+  resolvePendingSyncs(dis->rows_);
+}
+
 class Flush {
  public:
   std::mutex mutex_;
@@ -374,16 +413,12 @@ void RoctracerLogger::api_callback(
           insert_row_to_buffer(row);
         } break;
         case HIP_API_ID_hipStreamWaitEvent: {
-          // Resolve the producer record so the trace carries
-          // wait_on_stream + wait_on_hip_event_record_corr_id (CUPTI parity).
+          // Producer attribution is deferred to resolvePendingSyncs() at
+          // buffer-flush time. Resolving at callback delivery would fail
+          // when callbacks arrive out of order across threads (e.g. the
+          // wait callback lands on T2 before the producing
+          // hipEventRecord callback lands on T1).
           auto& args = data->args.hipStreamWaitEvent;
-          void* srcStream = nullptr;
-          uint64_t srcCorrId = 0;
-          RoctracerLogger::resolveWait(
-              static_cast<void*>(args.event),
-              data->correlation_id,
-              &srcStream,
-              &srcCorrId);
           rocprofSyncRow* row = new rocprofSyncRow(
               data->correlation_id,
               domain,
@@ -395,19 +430,13 @@ void RoctracerLogger::api_callback(
               ROCPROF_SYNC_STREAM_WAIT_EVENT,
               args.stream,
               args.event,
-              static_cast<hipStream_t>(srcStream),
-              srcCorrId);
+              /*srcStream=*/nullptr,
+              /*srcCorrId=*/0);
           insert_row_to_buffer(row);
         } break;
         case HIP_API_ID_hipEventSynchronize: {
+          // Same deferred-resolution pattern as hipStreamWaitEvent.
           auto& args = data->args.hipEventSynchronize;
-          void* srcStream = nullptr;
-          uint64_t srcCorrId = 0;
-          RoctracerLogger::resolveWait(
-              static_cast<void*>(args.event),
-              data->correlation_id,
-              &srcStream,
-              &srcCorrId);
           rocprofSyncRow* row = new rocprofSyncRow(
               data->correlation_id,
               domain,
@@ -419,8 +448,8 @@ void RoctracerLogger::api_callback(
               ROCPROF_SYNC_EVENT_SYNCHRONIZE,
               /*stream=*/nullptr,
               args.event,
-              static_cast<hipStream_t>(srcStream),
-              srcCorrId);
+              /*srcStream=*/nullptr,
+              /*srcCorrId=*/0);
           insert_row_to_buffer(row);
         } break;
         case HIP_API_ID_hipStreamSynchronize: {
