@@ -169,7 +169,12 @@ void libkineto_init(bool cpuOnly, [[maybe_unused]] bool logOnError) {
 
 #ifdef HAS_ROCTRACER
   if (!cpuOnly) {
+#ifndef ROCTRACER_FALLBACK
+    // rocprofiler-sdk requires explicit force-configure when libkineto is
+    // dlopen'd lazily; roctracer's registration model is different and does
+    // not need it.
     RocprofLogger::ensureRegistered();
+#endif
   }
 #endif
 
