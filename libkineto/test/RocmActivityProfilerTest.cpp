@@ -71,13 +71,24 @@ static constexpr int32_t kTruncatLength = 30;
 #define HIP_MEMCPY HIP_API_ID_hipMemcpy
 #define HIP_MALLOC HIP_API_ID_hipMalloc
 #define HIP_FREE HIP_API_ID_hipFree
+#define HIP_EVENT_RECORD_ID HIP_API_ID_hipEventRecord
+#define HIP_STREAM_WAIT_EVENT_ID HIP_API_ID_hipStreamWaitEvent
+#define HIP_EVENT_SYNCHRONIZE_ID HIP_API_ID_hipEventSynchronize
 #define RUNTIME_DOMAIN ACTIVITY_DOMAIN_HIP_API
+// Pick the right Logger for sync-API metadata helpers. Both backends expose
+// recordEvent / resolveWait / clearEventMap with identical signatures so the
+// same tests cover both code paths.
+using SyncMapLogger = ::RoctracerLogger;
 #else
 #define HIP_LAUNCH_KERNEL ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernel
 #define HIP_MEMCPY ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpy
 #define HIP_MALLOC ROCPROFILER_HIP_RUNTIME_API_ID_hipMalloc
 #define HIP_FREE ROCPROFILER_HIP_RUNTIME_API_ID_hipFree
+#define HIP_EVENT_RECORD_ID ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord
+#define HIP_STREAM_WAIT_EVENT_ID ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent
+#define HIP_EVENT_SYNCHRONIZE_ID ROCPROFILER_HIP_RUNTIME_API_ID_hipEventSynchronize
 #define RUNTIME_DOMAIN ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API
+using SyncMapLogger = ::RocprofLogger;
 #endif
 
 namespace {
@@ -310,11 +321,11 @@ struct MockRocLogger {
     activities_.push_back(row);
   }
 
-#ifndef ROCTRACER_FALLBACK
-  // Adds a hipEventRecord activity AND populates RocprofLogger's global
+  // Adds a hipEventRecord activity AND populates the backend logger's global
   // hipEvent_t -> {stream, corrId} map (just like the real api_callback
   // would). New tests should prefer addSyncActivityResolvingFromMap() so
-  // the JSON output goes through the production lookup path.
+  // the JSON output goes through the production lookup path. Works against
+  // both rocprofiler-sdk (RocprofLogger) and roctracer (RoctracerLogger).
   void addEventRecordActivity(
       int64_t start_ns,
       int64_t end_ns,
@@ -324,7 +335,7 @@ struct MockRocLogger {
     rocprofEventRecordRow* row = new rocprofEventRecordRow(
         correlation,
         RUNTIME_DOMAIN,
-        ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord,
+        HIP_EVENT_RECORD_ID,
         processId(),
         systemThreadId(),
         start_ns,
@@ -332,7 +343,7 @@ struct MockRocLogger {
         event,
         stream);
     activities_.push_back(row);
-    RocprofLogger::recordEvent(
+    SyncMapLogger::recordEvent(
         static_cast<void*>(event),
         static_cast<void*>(stream),
         static_cast<uint64_t>(correlation));
@@ -351,8 +362,8 @@ struct MockRocLogger {
       uint64_t srcCorrId) {
     uint32_t apiId =
         (syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE)
-        ? ROCPROFILER_HIP_RUNTIME_API_ID_hipEventSynchronize
-        : ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent;
+        ? HIP_EVENT_SYNCHRONIZE_ID
+        : HIP_STREAM_WAIT_EVENT_ID;
     rocprofSyncRow* row = new rocprofSyncRow(
         correlation,
         RUNTIME_DOMAIN,
@@ -369,10 +380,11 @@ struct MockRocLogger {
     activities_.push_back(row);
   }
 
-  // Lookup-driven variant: queries RocprofLogger's global event map for
-  // the producer record matching `event` whose correlationId is < `correlation`,
-  // matching the production api_callback path. Tests B1 (vector + upper_bound)
-  // and B3 (event sync resolution) end-to-end through the JSON output.
+  // Lookup-driven variant: queries the backend logger's global event map
+  // for the producer record matching `event` whose correlationId is
+  // < `correlation`, matching the production api_callback path. Exercises
+  // B1 (vector + upper_bound) and B3 (event sync resolution) end-to-end
+  // through the JSON output on either backend.
   void addSyncActivityResolvingFromMap(
       int64_t start_ns,
       int64_t end_ns,
@@ -386,7 +398,7 @@ struct MockRocLogger {
         syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) {
       void* resolvedStream = nullptr;
       uint64_t resolvedCorrId = 0;
-      if (RocprofLogger::resolveWait(
+      if (SyncMapLogger::resolveWait(
               static_cast<void*>(event),
               static_cast<uint64_t>(correlation),
               &resolvedStream,
@@ -399,7 +411,6 @@ struct MockRocLogger {
         start_ns, end_ns, correlation, syncType, stream, event, srcStream,
         srcCorrId);
   }
-#endif
 
   ~MockRocLogger() {
     while (!activities_.empty()) {
@@ -1136,7 +1147,6 @@ TEST_F(RocmActivityProfilerTest, JsonGPUIDSortTest) {
 #endif
 }
 
-#ifndef ROCTRACER_FALLBACK
 TEST_F(RocmActivityProfilerTest, InterStreamDependencyTest) {
   std::vector<std::string> log_modules({"RocmActivityProfiler.cpp"});
   SET_LOG_VERBOSITY_LEVEL(2, log_modules);
@@ -1224,16 +1234,18 @@ TEST_F(RocmActivityProfilerTest, InterStreamDependencyTest) {
   unlink(filename);
 }
 
-// Drives the production lookup helpers (RocprofLogger::recordEvent /
-// resolveWait / clearEventMap) so we exercise the same path used by the
-// rocprofiler-sdk api_callback. Verifies B1's vector-backed g_eventMap and
-// the upper_bound semantics on event-handle reuse.
+// Drives the production lookup helpers
+// (RocprofLogger / RoctracerLogger ::recordEvent / resolveWait / clearEventMap,
+// aliased here as SyncMapLogger). Exercises the same path used by the real
+// api_callback on whichever backend the test binary was built against, so
+// the same test covers both rocprofiler-sdk and roctracer code. Verifies
+// the vector-backed g_eventMap + upper_bound semantics on event-handle reuse.
 TEST_F(RocmActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   // Out-of-order delivery: two hipEventRecord callbacks land on the same
   // event handle (corr=100 then corr=200), and a hipStreamWaitEvent with
   // corr=101 lands AFTER both records. The wait should attribute its
   // producer to corr=100 (most recent record < 101), not corr=200.
-  RocprofLogger::clearEventMap();
+  SyncMapLogger::clearEventMap();
 
   RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
   int64_t start_time_ns =
@@ -1293,13 +1305,13 @@ TEST_F(RocmActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   EXPECT_TRUE(foundWait);
   unlink(filename);
 
-  RocprofLogger::clearEventMap();
+  SyncMapLogger::clearEventMap();
 }
 
 // Verifies B1's clear-on-reset behavior: records from a prior profiling
 // session must not leak into the next session's wait resolution.
 TEST_F(RocmActivityProfilerTest, EventMapClearedOnReset) {
-  RocprofLogger::clearEventMap();
+  SyncMapLogger::clearEventMap();
 
   hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xB);
   hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
@@ -1335,7 +1347,7 @@ TEST_F(RocmActivityProfilerTest, EventMapClearedOnReset) {
   // on reset, the wait must NOT resolve to session 1's stale record.
   void* outStream = nullptr;
   uint64_t outCorrId = 0;
-  EXPECT_FALSE(RocprofLogger::resolveWait(
+  EXPECT_FALSE(SyncMapLogger::resolveWait(
       static_cast<void*>(fakeEvent), 999, &outStream, &outCorrId))
       << "Stale record from a prior session should have been cleared";
 }
@@ -1344,7 +1356,7 @@ TEST_F(RocmActivityProfilerTest, EventMapClearedOnReset) {
 // attribution just like hipStreamWaitEvent, and the always-emitted
 // wait_on_hip_event_id field is present.
 TEST_F(RocmActivityProfilerTest, EventSynchronizeResolvesProducer) {
-  RocprofLogger::clearEventMap();
+  SyncMapLogger::clearEventMap();
 
   RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
   int64_t start_time_ns =
@@ -1405,13 +1417,13 @@ TEST_F(RocmActivityProfilerTest, EventSynchronizeResolvesProducer) {
   EXPECT_TRUE(foundEventSync) << "hipEventSynchronize activity not found";
   unlink(filename);
 
-  RocprofLogger::clearEventMap();
+  SyncMapLogger::clearEventMap();
 }
 
 // Verifies wait_on_hip_event_id is emitted even when the producer record is
 // absent (e.g., recorded before the trace window).
 TEST_F(RocmActivityProfilerTest, UnresolvedWaitStillEmitsEventId) {
-  RocprofLogger::clearEventMap();
+  SyncMapLogger::clearEventMap();
 
   RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
   int64_t start_time_ns =
@@ -1466,4 +1478,3 @@ TEST_F(RocmActivityProfilerTest, UnresolvedWaitStillEmitsEventId) {
   EXPECT_TRUE(foundUnresolvedWait);
   unlink(filename);
 }
-#endif
