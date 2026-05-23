@@ -10,6 +10,7 @@
 
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
