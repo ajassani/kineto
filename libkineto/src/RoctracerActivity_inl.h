@@ -261,7 +261,7 @@ inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
   std::string meta = fmt::format(
       R"JSON(
       "cid": {}, "correlation": {},
-      "sync_type": "{}")JSON",
+      "hip_sync_kind": "{}")JSON",
       raw().cid,
       raw().id,
       syncName);

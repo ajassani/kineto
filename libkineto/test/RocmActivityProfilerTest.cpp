@@ -1223,8 +1223,8 @@ TEST_F(RocmActivityProfilerTest, InterStreamDependencyTest) {
     }
     if (ev.value("name", "") == "hipStreamWaitEvent") {
       foundSyncWithDep = true;
-      EXPECT_TRUE(ev["args"].contains("sync_type"));
-      EXPECT_EQ(ev["args"]["sync_type"], "stream_wait_event");
+      EXPECT_TRUE(ev["args"].contains("hip_sync_kind"));
+      EXPECT_EQ(ev["args"]["hip_sync_kind"], "stream_wait_event");
       EXPECT_TRUE(ev["args"].contains("wait_on_stream"));
       EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_record_corr_id"));
       EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 10);
@@ -1405,7 +1405,7 @@ TEST_F(RocmActivityProfilerTest, EventSynchronizeResolvesProducer) {
     if (ev.value("name", "") == "hipEventSynchronize" &&
         ev.contains("args")) {
       foundEventSync = true;
-      EXPECT_EQ(ev["args"]["sync_type"], "event_synchronize");
+      EXPECT_EQ(ev["args"]["hip_sync_kind"], "event_synchronize");
       // wait_on_hip_event_id is always emitted for event-sync types
       EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_id"));
       // Producer attribution resolved from g_eventMap
