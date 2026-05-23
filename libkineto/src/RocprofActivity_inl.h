@@ -239,6 +239,79 @@ inline const std::string RuntimeActivity<rocprofMallocRow>::metadataJson() const
       raw().ptr);
 }
 
+template <>
+inline const std::string RuntimeActivity<rocprofEventRecordRow>::metadataJson()
+    const {
+  return fmt::format(
+      R"JSON(
+      "cid": {}, "correlation": {},
+      "hip_event": "{}", "hip_stream": "{}")JSON",
+      raw().cid,
+      raw().id,
+      fmt::ptr(raw().event),
+      fmt::ptr(raw().stream));
+}
+
+template <>
+inline const std::string RuntimeActivity<rocprofSyncRow>::metadataJson() const {
+  static const char* syncTypeNames[] = {
+      "stream_wait_event",
+      "event_synchronize",
+      "stream_synchronize",
+      "device_synchronize",
+  };
+  const char* syncName = (raw().syncType >= 0 && raw().syncType <= 3)
+      ? syncTypeNames[raw().syncType]
+      : "unknown";
+
+  std::string meta = fmt::format(
+      R"JSON(
+      "cid": {}, "correlation": {},
+      "sync_type": "{}")JSON",
+      raw().cid,
+      raw().id,
+      syncName);
+
+  meta += fmt::format(
+      R"JSON(,
+      "hip_stream": "{}")JSON",
+      fmt::ptr(raw().stream));
+  if (raw().event) {
+    meta += fmt::format(
+        R"JSON(,
+      "hip_event": "{}")JSON",
+        fmt::ptr(raw().event));
+  }
+  // Inter-stream dependency metadata: emitted for sync types that wait on a
+  // specific hipEvent_t (stream wait event, event synchronize) whenever the
+  // event was resolved against a prior hipEventRecord in g_eventMap. Field
+  // names mirror CUPTI's `wait_on_*` keys for CuptiActivityProfiler parity:
+  //
+  //   wait_on_stream                    <=> CUPTI wait_on_stream
+  //   wait_on_hip_event_record_corr_id  <=> CUPTI wait_on_cuda_event_record_corr_id
+  //   wait_on_hip_event_id              <=> CUPTI wait_on_cuda_event_id
+  //
+  // The last field reports the hipEvent_t handle the wait was issued against,
+  // independent of whether a producer record was found.
+  if ((raw().syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT ||
+       raw().syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) &&
+      raw().event) {
+    meta += fmt::format(
+        R"JSON(,
+      "wait_on_hip_event_id": "{}")JSON",
+        fmt::ptr(raw().event));
+    if (raw().srcCorrId) {
+      meta += fmt::format(
+          R"JSON(,
+      "wait_on_stream": "{}",
+      "wait_on_hip_event_record_corr_id": {})JSON",
+          fmt::ptr(raw().srcStream),
+          raw().srcCorrId);
+    }
+  }
+  return meta;
+}
+
 template <class T>
 inline const std::string RuntimeActivity<T>::metadataJson() const {
   return fmt::format(
