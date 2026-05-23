@@ -56,6 +56,11 @@ void RoctracerLogger::recordEvent(
   vec.insert(pos, entry);
 }
 
+void RoctracerLogger::unrecordEvent(void* event) {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  g_eventMap.erase(event);
+}
+
 bool RoctracerLogger::resolveWait(
     void* event,
     uint64_t queryCorrId,
@@ -348,6 +353,24 @@ void RoctracerLogger::api_callback(
               endTime,
               args.event,
               args.stream);
+          insert_row_to_buffer(row);
+        } break;
+        case HIP_API_ID_hipEventDestroy: {
+          // Evict the event from g_eventMap so a later allocation that
+          // happens to reuse this raw pointer cannot accidentally resolve
+          // to a producer record from the destroyed event.
+          auto& args = data->args.hipEventDestroy;
+          RoctracerLogger::unrecordEvent(static_cast<void*>(args.event));
+          // Still emit the runtime row for trace parity with CUPTI's
+          // cudaEventDestroy.
+          rocprofRow* row = new rocprofRow(
+              data->correlation_id,
+              domain,
+              cid,
+              processId(),
+              systemThreadId(),
+              startTime,
+              endTime);
           insert_row_to_buffer(row);
         } break;
         case HIP_API_ID_hipStreamWaitEvent: {

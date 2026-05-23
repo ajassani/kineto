@@ -1308,6 +1308,66 @@ TEST_F(RocmActivityProfilerTest, StreamWaitEventFutureCorrelation) {
   RoctracerLogger::clearEventMap();
 }
 
+// Verifies hipEventDestroy hook evicts the event's entries from
+// g_eventMap. Without this, an allocator that reuses a destroyed event's
+// raw pointer for a new event could see a wait on the new event resolve
+// to a producer record that belonged to the destroyed one.
+TEST_F(RocmActivityProfilerTest, EventMapEvictsOnDestroy) {
+  RoctracerLogger::clearEventMap();
+
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xE1);
+  hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
+
+  // Record evA at corr=10.
+  RoctracerLogger::recordEvent(
+      static_cast<void*>(fakeEvent),
+      static_cast<void*>(producer),
+      /*corrId=*/10);
+
+  // Before destroy, a wait at corr=20 resolves to {producer, 10}.
+  {
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    EXPECT_TRUE(RoctracerLogger::resolveWait(
+        static_cast<void*>(fakeEvent), 20, &outStream, &outCorrId));
+    EXPECT_EQ(outStream, static_cast<void*>(producer));
+    EXPECT_EQ(outCorrId, 10u);
+  }
+
+  // hipEventDestroy is hooked and calls unrecordEvent.
+  RoctracerLogger::unrecordEvent(static_cast<void*>(fakeEvent));
+
+  // After destroy, a wait at corr=30 on the same raw pointer (as if the
+  // allocator handed it back to a freshly created event that was never
+  // recorded in this trace) must NOT resolve to the stale producer.
+  {
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    EXPECT_FALSE(RoctracerLogger::resolveWait(
+        static_cast<void*>(fakeEvent), 30, &outStream, &outCorrId))
+        << "Destroyed-event record should have been evicted; the trace "
+           "must not claim a producer link for a never-recorded event.";
+  }
+
+  // A fresh record on the reused pointer at corr=40 should be the only
+  // entry visible to a subsequent wait at corr=50.
+  hipStream_t newProducer = reinterpret_cast<hipStream_t>(0x2);
+  RoctracerLogger::recordEvent(
+      static_cast<void*>(fakeEvent),
+      static_cast<void*>(newProducer),
+      /*corrId=*/40);
+  {
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    EXPECT_TRUE(RoctracerLogger::resolveWait(
+        static_cast<void*>(fakeEvent), 50, &outStream, &outCorrId));
+    EXPECT_EQ(outStream, static_cast<void*>(newProducer));
+    EXPECT_EQ(outCorrId, 40u);
+  }
+
+  RoctracerLogger::clearEventMap();
+}
+
 // Verifies B1's clear-on-reset behavior: records from a prior profiling
 // session must not leak into the next session's wait resolution.
 TEST_F(RocmActivityProfilerTest, EventMapClearedOnReset) {

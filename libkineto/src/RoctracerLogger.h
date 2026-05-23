@@ -97,6 +97,12 @@ class RoctracerLogger {
   // ROCm backends emit identical wait-event metadata.
   static void recordEvent(void* event, void* stream, uint64_t corrId);
 
+  // Evict all hipEventRecord observations for `event`. Called from the
+  // hipEventDestroy api_callback so a future allocation that happens to
+  // reuse this raw pointer cannot accidentally resolve to a record that
+  // belonged to the destroyed event.
+  static void unrecordEvent(void* event);
+
   // Look up the most recent hipEventRecord observation for `event` whose
   // correlationId is strictly less than `queryCorrId`. On success, sets
   // *outStream / *outCorrId and returns true.
