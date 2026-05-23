@@ -89,6 +89,29 @@ class RoctracerLogger {
   static void pushCorrelationID(uint64_t id, RocLogger::CorrelationDomain type);
   static void popCorrelationID(RocLogger::CorrelationDomain type);
 
+  // Insert a hipEventRecord observation into the global hipEvent_t ->
+  // sorted vector<{stream, correlationId}> map. Called from the
+  // hipEventRecord api_callback so a later hipStreamWaitEvent or
+  // hipEventSynchronize can attribute the wait to the producer stream
+  // and its correlation id. Mirrors RocprofLogger::recordEvent so both
+  // ROCm backends emit identical wait-event metadata.
+  static void recordEvent(void* event, void* stream, uint64_t corrId);
+
+  // Look up the most recent hipEventRecord observation for `event` whose
+  // correlationId is strictly less than `queryCorrId`. On success, sets
+  // *outStream / *outCorrId and returns true.
+  static bool resolveWait(
+      void* event,
+      uint64_t queryCorrId,
+      void** outStream,
+      uint64_t* outCorrId);
+
+  // Clears the global hipEvent_t -> {stream, correlationId} map populated by
+  // hipEventRecord api_callbacks. Must be called between profiling sessions
+  // (typically from RocmActivityProfiler::onResetTraceData) to prevent stale
+  // entries from a previous trace polluting the next one.
+  static void clearEventMap();
+
   void startLogging();
   void stopLogging();
   void clearLogs();

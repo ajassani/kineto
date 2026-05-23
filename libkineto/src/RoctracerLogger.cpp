@@ -22,6 +22,73 @@
 using namespace libkineto;
 using namespace std::chrono;
 
+// HipEvent_t -> sorted vector<{producer stream, producer correlation id}>.
+// Populated by every hipEventRecord api_callback; consumed by
+// hipStreamWaitEvent / hipEventSynchronize api_callbacks to attribute
+// inter-stream dependencies. The vector form handles event-handle reuse:
+// the same hipEvent_t can be recorded many times in a trace, and a later
+// wait must resolve to the producer record whose correlation id is
+// strictly less than the wait's own correlation id. Mirrors the design in
+// RocprofLogger.cpp so the rocprofiler-sdk and roctracer backends produce
+// identical wait_on_* trace fields.
+namespace {
+struct EventMapEntry {
+  hipStream_t stream{nullptr};
+  uint64_t corrId{0};
+};
+std::mutex g_eventMapMutex;
+std::unordered_map<void*, std::vector<EventMapEntry>> g_eventMap;
+} // namespace
+
+void RoctracerLogger::recordEvent(
+    void* event,
+    void* stream,
+    uint64_t corrId) {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  auto& vec = g_eventMap[event];
+  EventMapEntry entry{static_cast<hipStream_t>(stream), corrId};
+  auto pos = std::lower_bound(
+      vec.begin(),
+      vec.end(),
+      entry.corrId,
+      [](const EventMapEntry& a, uint64_t val) { return a.corrId < val; });
+  vec.insert(pos, entry);
+}
+
+bool RoctracerLogger::resolveWait(
+    void* event,
+    uint64_t queryCorrId,
+    void** outStream,
+    uint64_t* outCorrId) {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  auto it = g_eventMap.find(event);
+  if (it == g_eventMap.end()) {
+    return false;
+  }
+  const auto& vec = it->second;
+  auto pos = std::upper_bound(
+      vec.begin(),
+      vec.end(),
+      queryCorrId,
+      [](uint64_t val, const EventMapEntry& a) { return val < a.corrId; });
+  if (pos == vec.begin()) {
+    return false;
+  }
+  auto prev = std::prev(pos);
+  if (outStream) {
+    *outStream = static_cast<void*>(prev->stream);
+  }
+  if (outCorrId) {
+    *outCorrId = prev->corrId;
+  }
+  return true;
+}
+
+void RoctracerLogger::clearEventMap() {
+  std::lock_guard<std::mutex> lock(g_eventMapMutex);
+  g_eventMap.clear();
+}
+
 class Flush {
  public:
   std::mutex mutex_;
@@ -102,7 +169,7 @@ void RoctracerLogger::api_callback(
     uint32_t domain,
     uint32_t cid,
     const void* callback_data,
-    void* arg) {
+    [[maybe_unused]] void* arg) {
   RoctracerLogger* dis = &singleton();
 
   if (domain == ACTIVITY_DOMAIN_HIP_API && dis->loggedIds_.contains(cid)) {
@@ -262,6 +329,109 @@ void RoctracerLogger::api_callback(
               args.stream);
           insert_row_to_buffer(row);
         } break;
+        case HIP_API_ID_hipEventRecord: {
+          // Remember producer {stream, correlationId} so a future wait/sync
+          // on the same hipEvent_t can attribute itself to this record.
+          auto& args = data->args.hipEventRecord;
+          RoctracerLogger::recordEvent(
+              static_cast<void*>(args.event),
+              static_cast<void*>(args.stream),
+              data->correlation_id);
+          rocprofEventRecordRow* row = new rocprofEventRecordRow(
+              data->correlation_id,
+              domain,
+              cid,
+              processId(),
+              systemThreadId(),
+              startTime,
+              endTime,
+              args.event,
+              args.stream);
+          insert_row_to_buffer(row);
+        } break;
+        case HIP_API_ID_hipStreamWaitEvent: {
+          // Resolve the producer record so the trace carries
+          // wait_on_stream + wait_on_hip_event_record_corr_id (CUPTI parity).
+          auto& args = data->args.hipStreamWaitEvent;
+          void* srcStream = nullptr;
+          uint64_t srcCorrId = 0;
+          RoctracerLogger::resolveWait(
+              static_cast<void*>(args.event),
+              data->correlation_id,
+              &srcStream,
+              &srcCorrId);
+          rocprofSyncRow* row = new rocprofSyncRow(
+              data->correlation_id,
+              domain,
+              cid,
+              processId(),
+              systemThreadId(),
+              startTime,
+              endTime,
+              ROCPROF_SYNC_STREAM_WAIT_EVENT,
+              args.stream,
+              args.event,
+              static_cast<hipStream_t>(srcStream),
+              srcCorrId);
+          insert_row_to_buffer(row);
+        } break;
+        case HIP_API_ID_hipEventSynchronize: {
+          auto& args = data->args.hipEventSynchronize;
+          void* srcStream = nullptr;
+          uint64_t srcCorrId = 0;
+          RoctracerLogger::resolveWait(
+              static_cast<void*>(args.event),
+              data->correlation_id,
+              &srcStream,
+              &srcCorrId);
+          rocprofSyncRow* row = new rocprofSyncRow(
+              data->correlation_id,
+              domain,
+              cid,
+              processId(),
+              systemThreadId(),
+              startTime,
+              endTime,
+              ROCPROF_SYNC_EVENT_SYNCHRONIZE,
+              /*stream=*/nullptr,
+              args.event,
+              static_cast<hipStream_t>(srcStream),
+              srcCorrId);
+          insert_row_to_buffer(row);
+        } break;
+        case HIP_API_ID_hipStreamSynchronize: {
+          auto& args = data->args.hipStreamSynchronize;
+          rocprofSyncRow* row = new rocprofSyncRow(
+              data->correlation_id,
+              domain,
+              cid,
+              processId(),
+              systemThreadId(),
+              startTime,
+              endTime,
+              ROCPROF_SYNC_STREAM_SYNCHRONIZE,
+              args.stream,
+              /*event=*/nullptr,
+              /*srcStream=*/nullptr,
+              /*srcCorrId=*/0);
+          insert_row_to_buffer(row);
+        } break;
+        case HIP_API_ID_hipDeviceSynchronize: {
+          rocprofSyncRow* row = new rocprofSyncRow(
+              data->correlation_id,
+              domain,
+              cid,
+              processId(),
+              systemThreadId(),
+              startTime,
+              endTime,
+              ROCPROF_SYNC_DEVICE_SYNCHRONIZE,
+              /*stream=*/nullptr,
+              /*event=*/nullptr,
+              /*srcStream=*/nullptr,
+              /*srcCorrId=*/0);
+          insert_row_to_buffer(row);
+        } break;
         default: {
           rocprofRow* row = new rocprofRow(
               data->correlation_id,
@@ -291,7 +461,7 @@ void RoctracerLogger::api_callback(
 void RoctracerLogger::activity_callback(
     const char* begin,
     const char* end,
-    void* arg) {
+    [[maybe_unused]] void* arg) {
   // Log latest completed correlation id.  Used to ensure we have flushed all
   // data on stop
   std::unique_lock<std::mutex> lock(s_flush.mutex_);
