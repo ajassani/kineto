@@ -142,9 +142,15 @@ elseif(KINETO_BACKEND STREQUAL "rocm")
   message(STATUS "ROCM minor: ${ROCM_VERSION_DEV_MINOR}")
   message(STATUS "ROCM patch: ${ROCM_VERSION_DEV_PATCH}")
 
-  # Use rocprofiler-sdk for rocm version 6.4 forward
-  if((ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 7) OR (ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 6 AND ROCM_VERSION_DEV_MINOR GREATER_EQUAL 4))
-    set(USE_ROCPROFILER_SDK ON)
+  # Use rocprofiler-sdk for rocm version 6.4 forward by default, but let the
+  # caller force the backend explicitly (e.g. -DUSE_ROCPROFILER_SDK=OFF to
+  # build the legacy roctracer path on a 7.x system).
+  if(NOT DEFINED USE_ROCPROFILER_SDK AND NOT DEFINED CACHE{USE_ROCPROFILER_SDK})
+    if((ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 7) OR (ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 6 AND ROCM_VERSION_DEV_MINOR GREATER_EQUAL 4))
+      set(USE_ROCPROFILER_SDK ON)
+    else()
+      set(USE_ROCPROFILER_SDK OFF)
+    endif()
   endif()
   if(USE_ROCPROFILER_SDK)
     message(STATUS "Building with: rocprofiler-sdk")
