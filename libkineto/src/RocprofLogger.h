@@ -60,6 +60,13 @@ class RocprofLogger {
   static void api_callback(rocprofiler_callback_tracing_record_t record,
                            rocprofiler_user_data_t* user_data,
                            void* callback_data);
+  // ROCPROFILER_CALLBACK_TRACING_HIP_STREAM subscriber. Maintains a thread-
+  // local stack of SDK-assigned HIP stream_ids so the buffer callback can
+  // attribute GPU activities to the right hipStream_t. ROCm 6.4+.
+  static void hip_stream_callback(
+      rocprofiler_callback_tracing_record_t record,
+      rocprofiler_user_data_t* user_data,
+      void* callback_data);
   static void buffer_callback(rocprofiler_context_id_t context,
                               rocprofiler_buffer_id_t buffer_id,
                               rocprofiler_record_header_t** headers,

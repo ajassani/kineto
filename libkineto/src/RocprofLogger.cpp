@@ -154,6 +154,30 @@ auto extract_malloc_args =
   return 0;
 };
 
+// Stream attribution state.
+//
+// rocprofiler-sdk's kernel-dispatch / memory-copy buffer records carry
+// dispatch.queue_id.handle (the HSA queue), which is shared across HIP
+// streams on a device and isn't meaningful as a per-stream id in user-
+// facing traces. The real hipStream_t (and its SDK-assigned small-int
+// stream_id) is only available on the API-callback side.
+//
+// To bridge the two phases, the HIP_STREAM_SET callback domain (ROCm 6.4+)
+// fires ENTER/EXIT around every stream-bearing HIP API, kernel dispatch,
+// and memory copy with the SDK's stream_id in the payload. We maintain a
+// per-thread stack of stream_ids (mirroring rocprofv3's pattern, see
+// rocprofiler-sdk-tool/stream_stack.{hpp,cpp}) so that nested HIP calls
+// are handled correctly. At HIP_RUNTIME_API EXIT we snapshot stack-top
+// into g_corrToStream, keyed by correlation_id, and the async buffer
+// callback reads it back to populate the row's "stream" field.
+//
+// The SDK numbers streams sequentially per process (nullptr -> 0,
+// then 1, 2, ...) which matches roctracer's convention, so this PR
+// produces the same external behaviour as the roctracer backend.
+thread_local std::vector<uint64_t> tls_stream_stack;
+std::mutex g_corrToStreamMutex;
+std::unordered_map<uint64_t, uint64_t> g_corrToStream;
+
 // copy api calls
 bool isCopyApi(uint32_t id) {
   switch (id) {
@@ -397,6 +421,24 @@ int RocprofLogger::toolInit(
       api_callback,
       nullptr);
 
+  // Track the HIP stream of each stream-bearing API. The SDK fires
+  // ROCPROFILER_HIP_STREAM_SET ENTER/EXIT around every such call with the
+  // SDK-assigned stream_id in the payload, which we stash in
+  // tls_stream_stack (see hip_stream_callback). This lets buffer_callback
+  // attribute async kernel-dispatch / memory-copy records to the right
+  // hipStream_t instead of the meaningless HSA queue handle.
+  //
+  // Requires ROCm 6.4+ for the HIP_STREAM domain. Older toolchains use the
+  // roctracer backend (USE_ROCPROFILER_SDK is off by default below 6.4),
+  // so we don't need a version guard here.
+  rocprofiler_configure_callback_tracing_service(
+      globalContext.context,
+      ROCPROFILER_CALLBACK_TRACING_HIP_STREAM,
+      nullptr,
+      0,
+      hip_stream_callback,
+      nullptr);
+
   // Collect async ops via buffers
   constexpr auto buffer_size_bytes = 0x40000;
   constexpr auto buffer_watermark_bytes = buffer_size_bytes / 2;
@@ -544,6 +586,30 @@ void RocprofLogger::code_object_callback(
   }
 }
 
+void RocprofLogger::hip_stream_callback(
+    rocprofiler_callback_tracing_record_t record,
+    [[maybe_unused]] rocprofiler_user_data_t* user_data,
+    [[maybe_unused]] void* callback_data) {
+  if (record.kind != ROCPROFILER_CALLBACK_TRACING_HIP_STREAM) {
+    return;
+  }
+  if (record.operation != ROCPROFILER_HIP_STREAM_SET) {
+    // HIP_STREAM_CREATE / HIP_STREAM_DESTROY track stream-handle lifecycle,
+    // which we don't need: SET wraps every actual stream-bearing op.
+    return;
+  }
+  auto* data =
+      static_cast<rocprofiler_callback_tracing_hip_stream_data_t*>(
+          record.payload);
+  if (record.phase == ROCPROFILER_CALLBACK_PHASE_ENTER) {
+    tls_stream_stack.push_back(data->stream_id.handle);
+  } else if (record.phase == ROCPROFILER_CALLBACK_PHASE_EXIT) {
+    if (!tls_stream_stack.empty()) {
+      tls_stream_stack.pop_back();
+    }
+  }
+}
+
 void RocprofLogger::api_callback(
     rocprofiler_callback_tracing_record_t record,
     [[maybe_unused]] rocprofiler_user_data_t* user_data,
@@ -649,6 +715,24 @@ void RocprofLogger::api_callback(
             endTime);
         insert_row_to_buffer(row);
       }
+      // Capture the HIP stream of this API for the async buffer callback.
+      //
+      // The HIP_STREAM callback maintained tls_stream_stack with the
+      // SDK-assigned stream_id of the currently-executing stream-bearing
+      // API (top of stack). Snapshot it here under the API's correlation_id
+      // so buffer_callback can override the otherwise-meaningless HSA
+      // queue handle on kernel-dispatch / memory-copy rows.
+      //
+      // Sync ops (stream/event/device sync) and most other API kinds also
+      // pass through here. For those, the SDK doesn't emit an async buffer
+      // record so the entry is harmlessly orphaned (drained on profiler
+      // stop).
+      if (!tls_stream_stack.empty()) {
+        std::lock_guard<std::mutex> lk(g_corrToStreamMutex);
+        g_corrToStream[record.correlation_id.internal] =
+            tls_stream_stack.back();
+      }
+
       // External correlation
       static RocprofLogger* dis = &singleton();
       for (int it = RocLogger::CorrelationDomain::begin;
@@ -695,13 +779,28 @@ void RocprofLogger::buffer_callback(
             ? kernel_it->second
             : "<unknown kernel>";
 
+        // Look up the HIP stream_id captured at HIP_RUNTIME_API EXIT
+        // (see api_callback + hip_stream_callback). When set, this is the
+        // SDK-assigned per-process small int; we use it instead of
+        // dispatch.queue_id.handle, which is the HSA queue and shared
+        // across HIP streams on a device.
+        uint64_t stream_or_queue = dispatch.queue_id.handle;
+        {
+          std::lock_guard<std::mutex> lk(g_corrToStreamMutex);
+          auto it = g_corrToStream.find(record.correlation_id.internal);
+          if (it != g_corrToStream.end()) {
+            stream_or_queue = it->second;
+            g_corrToStream.erase(it);
+          }
+        }
+
         rocprofAsyncRow* row = new rocprofAsyncRow(
             record.correlation_id.internal,
             record.kind,
             record.operation,
             record.operation, // shared op - No longer a thing.  Placeholder
             device_id,
-            dispatch.queue_id.handle,
+            stream_or_queue,
             record.start_timestamp,
             record.end_timestamp,
             kernel_name);
@@ -718,13 +817,27 @@ void RocprofLogger::buffer_callback(
             ? agent_it->second.logical_node_type_id
             : -1;
 
+        // Look up the HIP stream_id captured at HIP_RUNTIME_API EXIT.
+        // Memory-copy buffer records have no queue/stream field of their
+        // own (the HSA queue is implementation-detail and not exposed),
+        // so upstream defaults to 0. Override when we know better.
+        uint64_t stream_or_queue = 0;
+        {
+          std::lock_guard<std::mutex> lk(g_corrToStreamMutex);
+          auto it = g_corrToStream.find(record.correlation_id.internal);
+          if (it != g_corrToStream.end()) {
+            stream_or_queue = it->second;
+            g_corrToStream.erase(it);
+          }
+        }
+
         rocprofAsyncRow* row = new rocprofAsyncRow(
             record.correlation_id.internal,
             record.kind,
             record.operation,
             record.operation, // shared op - No longer a thing.  Placeholder
             device_id,
-            0,
+            stream_or_queue,
             record.start_timestamp,
             record.end_timestamp,
             "");
