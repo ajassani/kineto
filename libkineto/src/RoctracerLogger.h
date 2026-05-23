@@ -89,6 +89,52 @@ class RoctracerLogger {
   static void pushCorrelationID(uint64_t id, RocLogger::CorrelationDomain type);
   static void popCorrelationID(RocLogger::CorrelationDomain type);
 
+  // Insert a hipEventRecord observation into the global hipEvent_t ->
+  // sorted vector<{stream, correlationId}> map. Called from the
+  // hipEventRecord api_callback so a later hipStreamWaitEvent or
+  // hipEventSynchronize can attribute the wait to the producer stream
+  // and its correlation id. Mirrors RocprofLogger::recordEvent so both
+  // ROCm backends emit identical wait-event metadata.
+  static void recordEvent(void* event, void* stream, uint64_t corrId);
+
+  // Evict all hipEventRecord observations for `event`. Called from the
+  // hipEventDestroy api_callback so a future allocation that happens to
+  // reuse this raw pointer cannot accidentally resolve to a record that
+  // belonged to the destroyed event.
+  static void unrecordEvent(void* event);
+
+  // Look up the most recent hipEventRecord observation for `event` whose
+  // correlationId is strictly less than `queryCorrId`. On success, sets
+  // *outStream / *outCorrId and returns true.
+  static bool resolveWait(
+      void* event,
+      uint64_t queryCorrId,
+      void** outStream,
+      uint64_t* outCorrId);
+
+  // Clears the global hipEvent_t -> {stream, correlationId} map populated by
+  // hipEventRecord api_callbacks. Must be called between profiling sessions
+  // (typically from RocmActivityProfiler::onResetTraceData) to prevent stale
+  // entries from a previous trace polluting the next one.
+  static void clearEventMap();
+
+  // Walks the singleton's pending row buffer and resolves producer
+  // attribution for every wait-event / event-sync row that was left
+  // unresolved at api_callback time. Called from
+  // RocmActivityProfiler::processGpuActivities before rows are emitted,
+  // so that out-of-order callback delivery (e.g. the hipStreamWaitEvent
+  // callback landing on a different thread before the producing
+  // hipEventRecord callback lands on its own thread) still resolves
+  // correctly as long as the producer record has arrived by the end of
+  // the trace.
+  static void resolvePendingSyncs();
+
+  // Testable overload: resolve sync rows in an arbitrary buffer (e.g.
+  // the mock RocLogger's local activities_ list in unit tests). Same
+  // semantics as the no-arg form but does NOT take the singleton's
+  // rows mutex; the caller is responsible for any synchronization.
+  static void resolvePendingSyncs(std::vector<rocprofBase*>& rows);
+
   void startLogging();
   void stopLogging();
   void clearLogs();

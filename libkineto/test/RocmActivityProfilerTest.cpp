@@ -71,6 +71,12 @@ static constexpr int32_t kTruncatLength = 30;
 #define HIP_MEMCPY HIP_API_ID_hipMemcpy
 #define HIP_MALLOC HIP_API_ID_hipMalloc
 #define HIP_FREE HIP_API_ID_hipFree
+// Macros used by the inter-stream-dep tests below. Only the roctracer
+// backend implements recordEvent / resolveWait / clearEventMap today; the
+// rocprofiler-sdk equivalent will be added in a follow-up PR.
+#define HIP_EVENT_RECORD_ID HIP_API_ID_hipEventRecord
+#define HIP_STREAM_WAIT_EVENT_ID HIP_API_ID_hipStreamWaitEvent
+#define HIP_EVENT_SYNCHRONIZE_ID HIP_API_ID_hipEventSynchronize
 #define RUNTIME_DOMAIN ACTIVITY_DOMAIN_HIP_API
 #else
 #define HIP_LAUNCH_KERNEL ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernel
@@ -310,6 +316,99 @@ struct MockRocLogger {
     activities_.push_back(row);
   }
 
+#ifdef ROCTRACER_FALLBACK
+  // Adds a hipEventRecord activity AND populates RoctracerLogger's global
+  // hipEvent_t -> sorted vector<{stream, corrId}> map (just like the real
+  // api_callback would). Tests that drive the production lookup path
+  // should prefer addSyncActivityResolvingFromMap(). The rocprofiler-sdk
+  // backend will gain the equivalent helpers in a follow-up PR.
+  void addEventRecordActivity(
+      int64_t start_ns,
+      int64_t end_ns,
+      int64_t correlation,
+      hipEvent_t event,
+      hipStream_t stream) {
+    rocprofEventRecordRow* row = new rocprofEventRecordRow(
+        correlation,
+        RUNTIME_DOMAIN,
+        HIP_EVENT_RECORD_ID,
+        processId(),
+        systemThreadId(),
+        start_ns,
+        end_ns,
+        event,
+        stream);
+    activities_.push_back(row);
+    RoctracerLogger::recordEvent(
+        static_cast<void*>(event),
+        static_cast<void*>(stream),
+        static_cast<uint64_t>(correlation));
+  }
+
+  // Pre-resolved variant: pass producer (srcStream, srcCorrId) directly.
+  // Used by tests that already know what the lookup should return.
+  void addSyncActivity(
+      int64_t start_ns,
+      int64_t end_ns,
+      int64_t correlation,
+      rocprofSyncType syncType,
+      hipStream_t stream,
+      hipEvent_t event,
+      hipStream_t srcStream,
+      uint64_t srcCorrId) {
+    uint32_t apiId =
+        (syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE)
+        ? HIP_EVENT_SYNCHRONIZE_ID
+        : HIP_STREAM_WAIT_EVENT_ID;
+    rocprofSyncRow* row = new rocprofSyncRow(
+        correlation,
+        RUNTIME_DOMAIN,
+        apiId,
+        processId(),
+        systemThreadId(),
+        start_ns,
+        end_ns,
+        syncType,
+        stream,
+        event,
+        srcStream,
+        srcCorrId);
+    activities_.push_back(row);
+  }
+
+  // Lookup-driven variant: queries RoctracerLogger's global event map for
+  // the producer record matching `event` whose correlationId is
+  // < `correlation`, matching the production api_callback path. Exercises
+  // the vector + upper_bound semantics and the event-sync resolution
+  // end-to-end through the JSON output.
+  void addSyncActivityResolvingFromMap(
+      int64_t start_ns,
+      int64_t end_ns,
+      int64_t correlation,
+      rocprofSyncType syncType,
+      hipStream_t stream,
+      hipEvent_t event) {
+    hipStream_t srcStream = nullptr;
+    uint64_t srcCorrId = 0;
+    if (syncType == ROCPROF_SYNC_STREAM_WAIT_EVENT ||
+        syncType == ROCPROF_SYNC_EVENT_SYNCHRONIZE) {
+      void* resolvedStream = nullptr;
+      uint64_t resolvedCorrId = 0;
+      if (RoctracerLogger::resolveWait(
+              static_cast<void*>(event),
+              static_cast<uint64_t>(correlation),
+              &resolvedStream,
+              &resolvedCorrId)) {
+        srcStream = static_cast<hipStream_t>(resolvedStream);
+        srcCorrId = resolvedCorrId;
+      }
+    }
+    addSyncActivity(
+        start_ns, end_ns, correlation, syncType, stream, event, srcStream,
+        srcCorrId);
+  }
+#endif
+
   ~MockRocLogger() {
     while (!activities_.empty()) {
       auto act = activities_.back();
@@ -348,6 +447,12 @@ class MockRocActivities : public RocprofActivityApi {
       externalCorrelations.clear();
     }
     detail::backfillAsyncCopyStreams(activityLogger->activities_, isAsyncCopy);
+#ifdef ROCTRACER_FALLBACK
+    // Mirror the production processGpuActivities path: resolve any
+    // sync rows that callbacks left unresolved (the new deferred
+    // resolution scheme) before they are handed to the trace logger.
+    RoctracerLogger::resolvePendingSyncs(activityLogger->activities_);
+#endif
     for (auto& item : activityLogger->activities_) {
       handler(item);
       ++count;
@@ -1044,3 +1149,481 @@ TEST_F(RocmActivityProfilerTest, JsonGPUIDSortTest) {
   }
 #endif
 }
+
+#ifdef ROCTRACER_FALLBACK
+// Inter-stream dependency tests are roctracer-only in this PR. The
+// rocprofiler-sdk backend will gain an equivalent implementation (and
+// these same tests will be re-enabled against it) in a follow-up PR.
+
+TEST_F(RocmActivityProfilerTest, InterStreamDependencyTest) {
+  std::vector<std::string> log_modules({"RocmActivityProfiler.cpp"});
+  SET_LOG_VERBOSITY_LEVEL(2, log_modules);
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 300;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // Simulate: hipEventRecord(event=0xA, stream=0x1) with corr=10
+  // then hipStreamWaitEvent(stream=0x2, event=0xA) with corr=20
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xA);
+  hipStream_t stream0 = reinterpret_cast<hipStream_t>(0x1);
+  hipStream_t stream1 = reinterpret_cast<hipStream_t>(0x2);
+
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 20, start_time_ns + 25, 10, fakeEvent, stream0);
+  gpuOps->addSyncActivity(
+      start_time_ns + 30, start_time_ns + 35, 20,
+      ROCPROF_SYNC_STREAM_WAIT_EVENT, stream1, fakeEvent, stream0, 10);
+  gpuOps->addKernelActivity(start_time_ns + 50, start_time_ns + 100, 1);
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  // Verify event record and sync activities are present
+  int eventRecordCount = 0;
+  int syncCount = 0;
+  for (auto& activity : *trace.activities()) {
+    if (activity->name() == "hipEventRecord") {
+      eventRecordCount++;
+    }
+    if (activity->name() == "hipStreamWaitEvent") {
+      syncCount++;
+    }
+  }
+  EXPECT_EQ(eventRecordCount, 1);
+  EXPECT_EQ(syncCount, 1);
+
+  // Verify JSON output contains dependency metadata
+  char filename[] = "/tmp/libkineto_interstream_testXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  auto& traceEvents = j["traceEvents"];
+
+  bool foundEventRecord = false;
+  bool foundSyncWithDep = false;
+  for (auto& ev : traceEvents) {
+    if (ev.value("name", "") == "hipEventRecord") {
+      foundEventRecord = true;
+      EXPECT_TRUE(ev["args"].contains("hip_event"));
+      EXPECT_TRUE(ev["args"].contains("hip_stream"));
+    }
+    if (ev.value("name", "") == "hipStreamWaitEvent") {
+      foundSyncWithDep = true;
+      EXPECT_TRUE(ev["args"].contains("hip_sync_kind"));
+      EXPECT_EQ(ev["args"]["hip_sync_kind"], "stream_wait_event");
+      EXPECT_TRUE(ev["args"].contains("wait_on_stream"));
+      EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_record_corr_id"));
+      EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 10);
+    }
+  }
+  EXPECT_TRUE(foundEventRecord);
+  EXPECT_TRUE(foundSyncWithDep);
+
+  unlink(filename);
+}
+
+// Drives the production lookup helpers
+// (RoctracerLogger ::recordEvent / resolveWait / clearEventMap) directly,
+// exercising the same path used by the real api_callback. Verifies the
+// vector-backed g_eventMap + upper_bound semantics on event-handle reuse.
+TEST_F(RocmActivityProfilerTest, StreamWaitEventFutureCorrelation) {
+  // Out-of-order delivery: two hipEventRecord callbacks land on the same
+  // event handle (corr=100 then corr=200), and a hipStreamWaitEvent with
+  // corr=101 lands AFTER both records. The wait should attribute its
+  // producer to corr=100 (most recent record < 101), not corr=200.
+  RoctracerLogger::clearEventMap();
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 500;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xA);
+  hipStream_t producer1 = reinterpret_cast<hipStream_t>(0x1);
+  hipStream_t producer2 = reinterpret_cast<hipStream_t>(0x2);
+  hipStream_t consumer = reinterpret_cast<hipStream_t>(0x3);
+
+  // Two records on the same event handle, corr=100 and corr=200.
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 20, start_time_ns + 25, 100, fakeEvent, producer1);
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 60, start_time_ns + 65, 200, fakeEvent, producer2);
+  // Wait at corr=101 must resolve to corr=100, not corr=200.
+  gpuOps->addSyncActivityResolvingFromMap(
+      start_time_ns + 40, start_time_ns + 45, 101,
+      ROCPROF_SYNC_STREAM_WAIT_EVENT, consumer, fakeEvent);
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  char filename[] = "/tmp/libkineto_future_corrXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  bool foundWait = false;
+  for (auto& ev : j["traceEvents"]) {
+    if (ev.value("name", "") == "hipStreamWaitEvent" &&
+        ev.contains("args") &&
+        ev["args"].contains("wait_on_hip_event_record_corr_id")) {
+      foundWait = true;
+      EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 100)
+          << "Wait should reference the record before it, not the future one";
+    }
+  }
+  EXPECT_TRUE(foundWait);
+  unlink(filename);
+
+  RoctracerLogger::clearEventMap();
+}
+
+// Verifies the deferred-resolution scheme handles out-of-order callback
+// delivery. roctracer callbacks are dispatched from the calling thread
+// at HIP_API_PHASE_EXIT, so a hipStreamWaitEvent callback on thread T2
+// can land before the producing hipEventRecord callback on thread T1.
+// Resolving producer attribution at api_callback time loses the link in
+// that case; deferring resolution to buffer-flush time recovers it.
+TEST_F(RocmActivityProfilerTest, StreamWaitEventCallbackArrivesBeforeRecord) {
+  RoctracerLogger::clearEventMap();
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 500;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xE2);
+  hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
+  hipStream_t consumer = reinterpret_cast<hipStream_t>(0x2);
+
+  // 1. The wait callback arrives FIRST -- the map is still empty, so the
+  //    row is pushed unresolved (srcStream=nullptr, srcCorrId=0). This
+  //    matches what RoctracerLogger::api_callback now does for every
+  //    hipStreamWaitEvent.
+  gpuOps->addSyncActivity(
+      start_time_ns + 40, start_time_ns + 45, /*correlation=*/200,
+      ROCPROF_SYNC_STREAM_WAIT_EVENT, consumer, fakeEvent,
+      /*srcStream=*/nullptr, /*srcCorrId=*/0);
+
+  // 2. The producing record callback arrives AFTER the wait. Populates
+  //    g_eventMap.
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 20, start_time_ns + 25, /*correlation=*/100,
+      fakeEvent, producer);
+
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  // processTrace will call processGpuActivities, which calls
+  // resolvePendingSyncs on the mock buffer (wired in MockRocActivities).
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  char filename[] = "/tmp/libkineto_late_recordXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  bool foundResolvedWait = false;
+  for (auto& ev : j["traceEvents"]) {
+    if (ev.value("name", "") == "hipStreamWaitEvent" &&
+        ev.contains("args") &&
+        ev["args"].contains("wait_on_hip_event_record_corr_id")) {
+      foundResolvedWait = true;
+      EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 100)
+          << "Deferred resolution should have back-filled the producer "
+             "attribution from the late-arriving record callback.";
+      EXPECT_TRUE(ev["args"].contains("wait_on_stream"));
+    }
+  }
+  EXPECT_TRUE(foundResolvedWait)
+      << "hipStreamWaitEvent activity with resolved producer not found "
+         "-- deferred resolution did not run or the buffer order broke it.";
+  unlink(filename);
+
+  RoctracerLogger::clearEventMap();
+}
+
+// Verifies hipEventDestroy hook evicts the event's entries from
+// g_eventMap. Without this, an allocator that reuses a destroyed event's
+// raw pointer for a new event could see a wait on the new event resolve
+// to a producer record that belonged to the destroyed one.
+TEST_F(RocmActivityProfilerTest, EventMapEvictsOnDestroy) {
+  RoctracerLogger::clearEventMap();
+
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xE1);
+  hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
+
+  // Record evA at corr=10.
+  RoctracerLogger::recordEvent(
+      static_cast<void*>(fakeEvent),
+      static_cast<void*>(producer),
+      /*corrId=*/10);
+
+  // Before destroy, a wait at corr=20 resolves to {producer, 10}.
+  {
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    EXPECT_TRUE(RoctracerLogger::resolveWait(
+        static_cast<void*>(fakeEvent), 20, &outStream, &outCorrId));
+    EXPECT_EQ(outStream, static_cast<void*>(producer));
+    EXPECT_EQ(outCorrId, 10u);
+  }
+
+  // hipEventDestroy is hooked and calls unrecordEvent.
+  RoctracerLogger::unrecordEvent(static_cast<void*>(fakeEvent));
+
+  // After destroy, a wait at corr=30 on the same raw pointer (as if the
+  // allocator handed it back to a freshly created event that was never
+  // recorded in this trace) must NOT resolve to the stale producer.
+  {
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    EXPECT_FALSE(RoctracerLogger::resolveWait(
+        static_cast<void*>(fakeEvent), 30, &outStream, &outCorrId))
+        << "Destroyed-event record should have been evicted; the trace "
+           "must not claim a producer link for a never-recorded event.";
+  }
+
+  // A fresh record on the reused pointer at corr=40 should be the only
+  // entry visible to a subsequent wait at corr=50.
+  hipStream_t newProducer = reinterpret_cast<hipStream_t>(0x2);
+  RoctracerLogger::recordEvent(
+      static_cast<void*>(fakeEvent),
+      static_cast<void*>(newProducer),
+      /*corrId=*/40);
+  {
+    void* outStream = nullptr;
+    uint64_t outCorrId = 0;
+    EXPECT_TRUE(RoctracerLogger::resolveWait(
+        static_cast<void*>(fakeEvent), 50, &outStream, &outCorrId));
+    EXPECT_EQ(outStream, static_cast<void*>(newProducer));
+    EXPECT_EQ(outCorrId, 40u);
+  }
+
+  RoctracerLogger::clearEventMap();
+}
+
+// Verifies B1's clear-on-reset behavior: records from a prior profiling
+// session must not leak into the next session's wait resolution.
+TEST_F(RocmActivityProfilerTest, EventMapClearedOnReset) {
+  RoctracerLogger::clearEventMap();
+
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xB);
+  hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
+
+  // Session 1: seed g_eventMap with a record, then call onResetTraceData
+  // (via profiler.reset()) which should clear it.
+  {
+    RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+    int64_t start_time_ns =
+        libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+    auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+    profiler.configure(*cfg_, start_time);
+    profiler.startTrace(start_time);
+    profiler.stopTrace(start_time + nanoseconds(500));
+    profiler.recordThreadInfo();
+
+    auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+        start_time_ns, start_time_ns + 500);
+    cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+    profiler.transferCpuTrace(std::move(cpuOps));
+
+    auto gpuOps = std::make_unique<MockRocLogger>();
+    gpuOps->addEventRecordActivity(
+        start_time_ns + 20, start_time_ns + 25, 50, fakeEvent, producer);
+    rocActivities_.activityLogger = std::move(gpuOps);
+
+    auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+    profiler.processTrace(*logger);
+    profiler.reset();
+  }
+
+  // Session 2: wait on the same event handle. With clearEventMap() called
+  // on reset, the wait must NOT resolve to session 1's stale record.
+  void* outStream = nullptr;
+  uint64_t outCorrId = 0;
+  EXPECT_FALSE(RoctracerLogger::resolveWait(
+      static_cast<void*>(fakeEvent), 999, &outStream, &outCorrId))
+      << "Stale record from a prior session should have been cleared";
+}
+
+// Verifies B3's CUPTI parity: hipEventSynchronize gets producer
+// attribution just like hipStreamWaitEvent, and the always-emitted
+// wait_on_hip_event_id field is present.
+TEST_F(RocmActivityProfilerTest, EventSynchronizeResolvesProducer) {
+  RoctracerLogger::clearEventMap();
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 300;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xC);
+  hipStream_t producer = reinterpret_cast<hipStream_t>(0x1);
+  // hipEventSynchronize is consumer-stream-less; pass nullptr for the
+  // consumer stream as the real API does.
+  hipStream_t consumer = nullptr;
+
+  gpuOps->addEventRecordActivity(
+      start_time_ns + 20, start_time_ns + 25, 30, fakeEvent, producer);
+  gpuOps->addSyncActivityResolvingFromMap(
+      start_time_ns + 50, start_time_ns + 60, 40,
+      ROCPROF_SYNC_EVENT_SYNCHRONIZE, consumer, fakeEvent);
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  char filename[] = "/tmp/libkineto_event_syncXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  bool foundEventSync = false;
+  for (auto& ev : j["traceEvents"]) {
+    if (ev.value("name", "") == "hipEventSynchronize" &&
+        ev.contains("args")) {
+      foundEventSync = true;
+      EXPECT_EQ(ev["args"]["hip_sync_kind"], "event_synchronize");
+      // wait_on_hip_event_id is always emitted for event-sync types
+      EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_id"));
+      // Producer attribution resolved from g_eventMap
+      EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_record_corr_id"));
+      EXPECT_EQ(ev["args"]["wait_on_hip_event_record_corr_id"], 30);
+      EXPECT_TRUE(ev["args"].contains("wait_on_stream"));
+    }
+  }
+  EXPECT_TRUE(foundEventSync) << "hipEventSynchronize activity not found";
+  unlink(filename);
+
+  RoctracerLogger::clearEventMap();
+}
+
+// Verifies wait_on_hip_event_id is emitted even when the producer record is
+// absent (e.g., recorded before the trace window).
+TEST_F(RocmActivityProfilerTest, UnresolvedWaitStillEmitsEventId) {
+  RoctracerLogger::clearEventMap();
+
+  RocmActivityProfiler profiler(rocActivities_, /*cpu only*/ false);
+  int64_t start_time_ns =
+      libkineto::timeSinceEpoch(std::chrono::system_clock::now());
+  int64_t duration_ns = 300;
+  auto start_time = time_point<system_clock>(nanoseconds(start_time_ns));
+  profiler.configure(*cfg_, start_time);
+  profiler.startTrace(start_time);
+  profiler.stopTrace(start_time + nanoseconds(duration_ns));
+  profiler.recordThreadInfo();
+
+  auto cpuOps = std::make_unique<MockCpuActivityBuffer>(
+      start_time_ns, start_time_ns + duration_ns);
+  cpuOps->addOp("op1", start_time_ns + 10, start_time_ns + 30, 1);
+  profiler.transferCpuTrace(std::move(cpuOps));
+
+  // No addEventRecordActivity: the wait fires on an event that was never
+  // observed in this trace window.
+  auto gpuOps = std::make_unique<MockRocLogger>();
+  hipEvent_t fakeEvent = reinterpret_cast<hipEvent_t>(0xD);
+  hipStream_t consumer = reinterpret_cast<hipStream_t>(0x2);
+  gpuOps->addSyncActivityResolvingFromMap(
+      start_time_ns + 50, start_time_ns + 60, 70,
+      ROCPROF_SYNC_STREAM_WAIT_EVENT, consumer, fakeEvent);
+  rocActivities_.activityLogger = std::move(gpuOps);
+
+  auto logger = std::make_unique<MemoryTraceLogger>(*cfg_);
+  profiler.processTrace(*logger);
+  profiler.reset();
+
+  ActivityTrace trace(std::move(logger), loggerFactory);
+
+  char filename[] = "/tmp/libkineto_unresolved_waitXXXXXX.json";
+  { int tmp_fd = mkstemps(filename, 5);
+    if (tmp_fd >= 0) close(tmp_fd); }
+  trace.save(filename);
+
+  std::ifstream f(filename);
+  nlohmann::json j = nlohmann::json::parse(f);
+  bool foundUnresolvedWait = false;
+  for (auto& ev : j["traceEvents"]) {
+    if (ev.value("name", "") == "hipStreamWaitEvent" &&
+        ev.contains("args")) {
+      foundUnresolvedWait = true;
+      // Event id must still be emitted for tooling correlation.
+      EXPECT_TRUE(ev["args"].contains("wait_on_hip_event_id"));
+      // Producer attribution must be absent.
+      EXPECT_FALSE(ev["args"].contains("wait_on_hip_event_record_corr_id"));
+      EXPECT_FALSE(ev["args"].contains("wait_on_stream"));
+    }
+  }
+  EXPECT_TRUE(foundUnresolvedWait);
+  unlink(filename);
+}
+
+#endif // ROCTRACER_FALLBACK

@@ -162,6 +162,13 @@ void RocmActivityProfiler::popCorrelationIdImpl(CorrelationFlowType type) {
 
 void RocmActivityProfiler::onResetTraceData() {
   roc_.teardownContext();
+#ifdef ROCTRACER_FALLBACK
+  // Drop any hipEvent_t -> {stream, corrId} entries left over from the prior
+  // profiling session so they cannot be returned as the producer of a wait
+  // recorded in the next session. Mirrors
+  // CuptiActivityProfiler::onResetTraceData.
+  RoctracerLogger::clearEventMap();
+#endif
 }
 
 void RocmActivityProfiler::onFinalizeTrace(
@@ -186,6 +193,12 @@ void RocmActivityProfiler::processGpuActivities(ActivityLogger& logger) {
           std::placeholders::_2,
           std::placeholders::_3));
 #else
+  // Resolve producer attribution for any wait-event / event-sync rows
+  // that were left unresolved at api_callback delivery time. By now all
+  // hipEventRecord callbacks for the trace have run, so resolution sees
+  // the final state of g_eventMap and is robust to cross-thread
+  // out-of-order callback delivery.
+  RoctracerLogger::resolvePendingSyncs();
   const int count = roc_.processActivities(
       std::bind(
           &RocmActivityProfiler::handleRoctracerActivity,
@@ -313,6 +326,14 @@ void RocmActivityProfiler::handleRoctracerActivity(
     case ROCTRACER_ACTIVITY_ASYNC:
       handleGpuActivity(
           reinterpret_cast<const roctracerAsyncRow*>(record), logger);
+      break;
+    case ROCTRACER_ACTIVITY_EVENT_RECORD:
+      handleRuntimeActivity(
+          reinterpret_cast<const rocprofEventRecordRow*>(record), logger);
+      break;
+    case ROCTRACER_ACTIVITY_SYNC:
+      handleRuntimeActivity(
+          reinterpret_cast<const rocprofSyncRow*>(record), logger);
       break;
     case ROCTRACER_ACTIVITY_NONE:
     default:

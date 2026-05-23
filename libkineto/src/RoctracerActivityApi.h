@@ -56,7 +56,7 @@ class RoctracerActivityApi {
   std::atomic_bool stopCollection{false};
 
  private:
-  bool registered_{false};
+  [[maybe_unused]] bool registered_{false};
 
   // Enabled Activity Filters
   uint32_t activityMask_{0};

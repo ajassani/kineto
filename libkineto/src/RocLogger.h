@@ -69,6 +69,8 @@ typedef enum {
   ROCTRACER_ACTIVITY_COPY,
   ROCTRACER_ACTIVITY_MALLOC,
   ROCTRACER_ACTIVITY_ASYNC,
+  ROCTRACER_ACTIVITY_EVENT_RECORD,
+  ROCTRACER_ACTIVITY_SYNC,
   ROCTRACER_ACTIVITY_NONE
 } rocprof_activity_types;
 
@@ -212,4 +214,56 @@ struct rocprofAsyncRow : public rocprofBase {
   int device;
   uint64_t queue;
   std::string kernelName;
+};
+
+enum rocprofSyncType {
+  ROCPROF_SYNC_STREAM_WAIT_EVENT = 0,
+  ROCPROF_SYNC_EVENT_SYNCHRONIZE,
+  ROCPROF_SYNC_STREAM_SYNCHRONIZE,
+  ROCPROF_SYNC_DEVICE_SYNCHRONIZE,
+};
+
+struct rocprofEventRecordRow : public rocprofRow {
+  rocprofEventRecordRow(uint64_t id,
+                        uint32_t domain,
+                        uint32_t cid,
+                        uint32_t pid,
+                        uint32_t tid,
+                        uint64_t begin,
+                        uint64_t end,
+                        hipEvent_t event,
+                        hipStream_t stream)
+      : rocprofRow(id, domain, cid, pid, tid, begin, end,
+                   ROCTRACER_ACTIVITY_EVENT_RECORD),
+        event(event),
+        stream(stream) {}
+  hipEvent_t event;
+  hipStream_t stream;
+};
+
+struct rocprofSyncRow : public rocprofRow {
+  rocprofSyncRow(uint64_t id,
+                 uint32_t domain,
+                 uint32_t cid,
+                 uint32_t pid,
+                 uint32_t tid,
+                 uint64_t begin,
+                 uint64_t end,
+                 rocprofSyncType syncType,
+                 hipStream_t stream,
+                 hipEvent_t event,
+                 hipStream_t srcStream,
+                 uint64_t srcCorrId)
+      : rocprofRow(id, domain, cid, pid, tid, begin, end,
+                   ROCTRACER_ACTIVITY_SYNC),
+        syncType(syncType),
+        stream(stream),
+        event(event),
+        srcStream(srcStream),
+        srcCorrId(srcCorrId) {}
+  rocprofSyncType syncType;
+  hipStream_t stream;
+  hipEvent_t event;
+  hipStream_t srcStream;
+  uint64_t srcCorrId;
 };
