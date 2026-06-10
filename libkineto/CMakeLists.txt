@@ -27,6 +27,9 @@ set(KINETO_LIBRARY_TYPE "default" CACHE STRING
 set_property(CACHE KINETO_LIBRARY_TYPE PROPERTY STRINGS default shared static)
 option(KINETO_BUILD_TESTS "Build kineto unit tests" ON)
 option(KINETO_BUILD_BENCHMARKS "Build kineto benchmarks" OFF)
+option(KINETO_ENABLE_PERFETTO "Enable native Perfetto/pftrace trace export" OFF)
+set(PERFETTO_SOURCE_DIR "" CACHE PATH
+  "Path to a Perfetto checkout containing sdk/perfetto.h and sdk/perfetto.cc")
 
 set(LIBKINETO_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(LIBKINETO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -213,6 +216,33 @@ elseif(KINETO_BACKEND STREQUAL "xpu")
   endif()
 endif()
 
+if(KINETO_ENABLE_PERFETTO)
+  if(NOT PERFETTO_SOURCE_DIR)
+    if(DEFINED ENV{PERFETTO_SOURCE_DIR})
+      set(PERFETTO_SOURCE_DIR "$ENV{PERFETTO_SOURCE_DIR}")
+    elseif(EXISTS "${LIBKINETO_THIRDPARTY_DIR}/perfetto/sdk/perfetto.h")
+      set(PERFETTO_SOURCE_DIR "${LIBKINETO_THIRDPARTY_DIR}/perfetto")
+    endif()
+  endif()
+  if(NOT EXISTS "${PERFETTO_SOURCE_DIR}/sdk/perfetto.h" OR
+     NOT EXISTS "${PERFETTO_SOURCE_DIR}/sdk/perfetto.cc")
+    message(FATAL_ERROR
+      "KINETO_ENABLE_PERFETTO=ON requires PERFETTO_SOURCE_DIR to point to "
+      "a Perfetto checkout containing sdk/perfetto.h and sdk/perfetto.cc.")
+  endif()
+  add_library(kineto_perfetto STATIC
+    "${PERFETTO_SOURCE_DIR}/sdk/perfetto.cc")
+  target_include_directories(kineto_perfetto SYSTEM PUBLIC
+    "${PERFETTO_SOURCE_DIR}/sdk")
+  set_target_properties(kineto_perfetto PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
+  if(MSVC)
+    target_compile_options(kineto_perfetto PRIVATE /w)
+  else()
+    target_compile_options(kineto_perfetto PRIVATE -w -O0 -g0)
+  endif()
+  list(APPEND KINETO_DEFINITIONS "KINETO_ENABLE_PERFETTO")
+endif()
 target_compile_definitions(kineto_base PUBLIC "${KINETO_DEFINITIONS}")
 target_compile_options(kineto_base PRIVATE "${KINETO_COMPILE_OPTIONS}")
 target_compile_definitions(kineto_api PUBLIC "${KINETO_DEFINITIONS}")
@@ -249,6 +279,9 @@ target_include_directories(kineto_base SYSTEM PUBLIC
       $<BUILD_INTERFACE:${DYNOLOG_INCLUDE_DIR}>
       $<BUILD_INTERFACE:${IPCFABRIC_INCLUDE_DIR}>)
 target_link_libraries(kineto_base PRIVATE $<BUILD_INTERFACE:fmt::fmt-header-only>)
+if(KINETO_ENABLE_PERFETTO)
+  target_link_libraries(kineto_base PUBLIC kineto_perfetto)
+endif()
 
 target_include_directories(kineto_api PUBLIC
       $<BUILD_INTERFACE:${LIBKINETO_DIR}>
@@ -265,6 +298,9 @@ elseif(NOT KINETO_LIBRARY_TYPE STREQUAL "default")
 endif()
 
 add_library(kineto $<TARGET_OBJECTS:kineto_base> $<TARGET_OBJECTS:kineto_api>)
+if(KINETO_ENABLE_PERFETTO)
+  target_link_libraries(kineto $<BUILD_INTERFACE:kineto_perfetto>)
+endif()
 if(BUILD_SHARED_LIBS)
   set_property(TARGET kineto_base PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET kineto_api PROPERTY POSITION_INDEPENDENT_CODE ON)

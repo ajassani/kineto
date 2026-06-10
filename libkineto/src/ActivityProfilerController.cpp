@@ -32,6 +32,9 @@
 
 #include "output_json.h"
 #include "output_membuf.h"
+#ifdef KINETO_ENABLE_PERFETTO
+#include "output_perfetto.h"
+#endif
 
 #include "Logger.h"
 
@@ -111,6 +114,11 @@ static ActivityLoggerFactory initLoggerFactory() {
   factory.addProtocol("file", [](const std::string& url) {
     return std::unique_ptr<ActivityLogger>(new ChromeTraceLogger(url));
   });
+#ifdef KINETO_ENABLE_PERFETTO
+  factory.addProtocol("pftrace", [](const std::string& url) {
+    return std::unique_ptr<ActivityLogger>(new PerfettoTraceLogger(url));
+  });
+#endif
   return factory;
 }
 

@@ -15,6 +15,9 @@
 #include "ActivityTraceInterface.h"
 #include "output_json.h"
 #include "output_membuf.h"
+#ifdef KINETO_ENABLE_PERFETTO
+#include "output_perfetto.h"
+#endif
 
 namespace libkineto {
 
@@ -31,7 +34,7 @@ class ActivityTrace : public ActivityTraceInterface {
     std::string prefix;
     // if no protocol is specified, default to file
     if (url.find("://") == url.npos) {
-      prefix = "file://";
+      prefix = url.ends_with(".pftrace") ? "pftrace://" : "file://";
     }
     memLogger_->setChromeLogger(loggerFactory_.makeLogger(prefix + url));
     memLogger_->log(*memLogger_->getChromeLogger());
